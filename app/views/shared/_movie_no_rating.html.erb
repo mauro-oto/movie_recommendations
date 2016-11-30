@@ -1,0 +1,32 @@
+<div class="ratings-movie">
+  <div class='poster'>
+    <%= link_to image_tag(movie.poster_url, height: '300'), movie.trailer_url %>
+  </div>
+
+  <div class='title'>
+    <%= link_to movie.title, movie.trailer_url %>
+  </div>
+
+  <span class='date'>
+     (<%= movie.release_date.try(:year) || "N/A" %>)
+  </span>
+
+  <span class='mpaa-rating'>
+    <% if movie.mpaa_rating.try(:empty?) %>
+      Not Rated
+    <% else %>
+      <%= movie.mpaa_rating %>
+    <% end %>
+  </span>
+
+  <div class="rating" data-current_rating="<%= current_rating if current_rating %>">
+    <% (1..5).each do |star| %>
+      <%= link_to '☆', ratings_path(rating_value: star, movie_id: movie.id),
+                        method: :post, remote: true,
+                        class: "movie-rating-value",
+                        "data-movie_id" => movie.id,
+                        "data-rating_value" => star %>
+    <% end %>
+  </div>
+
+</div>

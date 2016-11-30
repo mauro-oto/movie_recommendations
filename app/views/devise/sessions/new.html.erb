@@ -1,0 +1,15 @@
+<div class="front-form">
+  <%= form_for(resource, as: resource_name, url: session_path(resource_name)) do |f| %>
+    <div class="email">
+      <%= f.email_field :email, autofocus: true, placeholder: "juan@perez.com" %>
+    </div>
+
+    <div class="password">
+      <%= f.password_field :password, autocomplete: "off", placeholder: "Password" %>
+    </div>
+
+    <div class="actions">
+      <%= f.submit "Log in", class: "pure-button pure-button-primary" %>
+    </div>
+  <% end %>
+</div>

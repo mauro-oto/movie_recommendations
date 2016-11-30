@@ -1,0 +1,16 @@
+<div class='movie-list'>
+  <% if @recommendations.empty? %>
+    <h2>
+      <%= link_to "Please rate more movies to receive recommendations!", ratings_path %>
+    </h2>
+  <% else %>
+    <% @recommendations.each do |recommendation| %>
+      <% rated_movie = @ratings.include?(recommendation.movie_id) %>
+      <% current_rating = @rating_values[recommendation.movie_id].to_i %>
+      <%= render 'shared/movie_no_rating', movie: recommendation.movie,
+                                           rated_movie: rated_movie,
+                                           current_rating: current_rating %>
+    <% end %>
+  <% end %>
+
+</div>

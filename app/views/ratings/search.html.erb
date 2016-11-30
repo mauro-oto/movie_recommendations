@@ -1,0 +1,38 @@
+<div class='movie-list'>
+  <% if @actor_movies.nil? && @director_movies.nil? && @movies.nil? %>
+    <p>Nothing matched your search.</p>
+  <% elsif @actor_movies %>
+    <% @actor_movies.each do |movie| %>
+      <% rated_movie =  @ratings_movie_ids.include? movie.id %>
+      <% current_rating = @rating_values[movie.id].to_i %>
+      <% if rated_movie %>
+        <% rating = Rating.where(movie_id: movie.id, user_id: current_user.id).first %>
+        <%= render 'shared/movie', movie: movie, rated_movie: rated_movie, current_rating: current_rating, rating: rating %>
+      <% else %>
+        <%= render 'shared/movie_no_rating', movie: movie, rated_movie: rated_movie, current_rating: current_rating %>
+      <% end %>
+    <% end %>
+  <% elsif @director_movies %>
+    <% @director_movies.each do |movie| %>
+      <% rated_movie =  @ratings_movie_ids.include? movie.id %>
+      <% current_rating = @rating_values[movie.id].to_i %>
+      <% if rated_movie %>
+        <% rating = Rating.where(movie_id: movie.id, user_id: current_user.id).first %>
+        <%= render 'shared/movie', movie: movie, rated_movie: rated_movie, current_rating: current_rating, rating: rating %>
+      <% else %>
+        <%= render 'shared/movie_no_rating', movie: movie, rated_movie: rated_movie, current_rating: current_rating %>
+      <% end %>
+    <% end %>
+  <% else %>
+    <% @movies.each do |movie| %>
+      <% rated_movie =  @ratings_movie_ids.include? movie.id %>
+      <% current_rating = @rating_values[movie.id].to_i %>
+      <% if rated_movie %>
+        <% rating = Rating.where(movie_id: movie.id, user_id: current_user.id).first %>
+        <%= render 'shared/movie', movie: movie, rated_movie: rated_movie, current_rating: current_rating, rating: rating %>
+      <% else %>
+        <%= render 'shared/movie_no_rating', movie: movie, rated_movie: rated_movie, current_rating: current_rating %>
+      <% end %>
+    <% end %>
+  <% end %>
+</div>

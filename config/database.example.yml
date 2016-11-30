@@ -1,0 +1,19 @@
+---
+common: &common
+  adapter: postgresql
+  username: mauro-oto
+  password:
+  host: localhost
+  timeout: 5000
+
+development:
+  <<: *common
+  database: movie_recommendations_dev
+
+test:
+  <<: *common
+  database: movie_recommendations_test
+
+production:
+  <<: *common
+  database: movie_recommendations_prod

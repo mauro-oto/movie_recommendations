@@ -1,0 +1,42 @@
+<% @prepopulated_upcoming_movies.each do |upcoming| %>
+  <div class="movie">
+    <div class='poster'>
+      <%= image_tag(upcoming['posters']['detailed'], height: "250") %>
+    </div>
+
+    <div class="title">
+      <%= upcoming['title']%>
+    </div>
+
+    <div class="release_date">
+      <%= upcoming['release_dates']['theater'] %>
+    </div>
+
+    <div class="tomatoes">
+      <% if upcoming['ratings']['critics_rating'] == 'Fresh' %>
+        <%= image_tag '/assets/tomatoe-icons.png', height:15 %>
+      <% elsif upcoming['ratings']['critics_rating'] == 'Rotten'%>
+        <%= image_tag '/assets/rotten.gif', height:15 %>
+      <% else %>
+      <% end %>
+      <span class="critics_rating">
+        <%= upcoming['ratings']['critics_rating'] %>
+      </span>
+
+      <% if upcoming['ratings']['critics_score'] < 65 %>
+        <i class="icon-thumbs-down-alt"></i>
+      <% elsif upcoming['ratings']['critics_score'] >= 65 && upcoming['ratings']['critics_score'] <= 75 %>
+        <i class="icon-meh"></i>
+      <% else %>
+        <i class="icon-thumbs-up-alt"></i>
+      <% end %>
+      <span class="critics_score">
+        <%= upcoming['ratings']['critics_score'] %>
+      </span>%
+      <span class="audience_score">
+        <i class="icon-male"></i>
+        <%= upcoming['ratings']['audience_score'] %>
+      </span>%
+    </div>
+  </div>
+<% end %>

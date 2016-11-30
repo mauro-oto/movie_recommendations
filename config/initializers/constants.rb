@@ -1,0 +1,1 @@
+RECOMMENDATION_LIMITS = { 3 => 10, 4 => 20, 5 => 30 }

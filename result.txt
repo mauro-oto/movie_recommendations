@@ -1,0 +1,6303 @@
+app/controllers/application_controller.rb
+---
+class ApplicationController < ActionController::Base
+  protect_from_forgery
+
+  def get_ratings!
+    @ratings = current_user.ratings
+    @ratings_movie_ids = @ratings.pluck(:movie_id)
+    @rating_values = {}
+    current_user.ratings.each do |rating|
+      @rating_values[rating.movie_id] = rating.rating_value
+    end
+  end
+
+end
+
+app/controllers/home_controller.rb
+---
+class HomeController < ApplicationController
+  def index
+    redirect_to recommendations_path if current_user
+  end
+end
+
+app/controllers/ratings_controller.rb
+---
+class RatingsController < ApplicationController
+  before_filter :authenticate_user!
+  before_filter :get_ratings!
+
+  def index
+    @movies = Movie.where(demo_display: true).sample(24)
+  end
+
+  def create
+    rating = current_user.ratings.build(rating_params)
+
+    if rating.save
+      UpdateRecommendationsWorker.perform_async(rating.id)
+      render json: rating
+    else
+      render json: rating.errors
+    end
+  end
+
+  def update
+    rating = current_user.ratings.find(params[:id])
+    rating.rating_value = params[:rating_value]
+
+    if rating.save
+      UpdateRecommendationsWorker.perform_async(rating.id)
+      render json: rating
+    else
+      flash[:notice] = "Your rating was not updated."
+      render json: rating.errors
+    end
+  end
+
+  def search
+    result = Pose.search(params[:query], [Movie, Actor, Director], limit: 20)
+    query_match = params[:query].downcase
+    result[Actor].each do |actor|
+      if actor.name.downcase == query_match
+        @actor_movies = actor.movies
+      end
+    end
+
+    result[Director].each do |director|
+      if director.name.downcase == query_match
+        @director_movies = director.movies
+      end
+    end
+
+    @movies = result[Movie]
+  end
+
+  private
+
+  def rating_params
+    { movie_id: params[:movie_id].to_i,
+      rating_value: params[:rating_value].to_i }
+  end
+end
+
+app/controllers/recommendations_controller.rb
+---
+class RecommendationsController < ApplicationController
+  before_filter :authenticate_user!
+  before_filter :get_ratings!
+
+  def index
+    @recommendations = current_user.unrated_recommendations
+                                   .includes(:movie)
+                                   .shuffle
+  end
+
+end
+
+app/controllers/users_controller.rb
+---
+class UsersController < ApplicationController
+  before_filter :authenticate_user!
+  before_filter :get_ratings!
+
+  def ratings
+    @ratings = current_user.ratings.reverse
+  end
+end
+
+app/helpers/application_helper.rb
+---
+module ApplicationHelper
+
+  def resource_name
+    :user
+  end
+
+  def resource
+    @resource ||= User.new
+  end
+
+  def devise_mapping
+    @devise_mapping ||= Devise.mappings[:user]
+  end
+
+end
+
+app/models/actor.rb
+---
+class Actor < ActiveRecord::Base
+  has_many :actors_movies, dependent: :destroy
+  has_many :movies, through: :actors_movies
+
+  validates :name, presence: true
+
+  posify { name }
+end
+
+app/models/actors_movie.rb
+---
+class ActorsMovie < ActiveRecord::Base
+  belongs_to :actor
+  belongs_to :movie
+end
+
+app/models/director.rb
+---
+class Director < ActiveRecord::Base
+  has_many :directors_movies, dependent: :destroy
+  has_many :movies, through: :directors_movies
+
+  validates :name, presence: true
+
+  posify { name }
+end
+
+app/models/directors_movie.rb
+---
+class DirectorsMovie < ActiveRecord::Base
+  belongs_to :movie
+  belongs_to :director
+end
+
+app/models/genre.rb
+---
+class Genre < ActiveRecord::Base
+  has_many :genres_movies, dependent: :destroy
+  has_many :movies, through: :genres_movies
+
+  validates :name, presence: true
+end
+
+app/models/genres_movie.rb
+---
+class GenresMovie < ActiveRecord::Base
+  belongs_to :movie
+  belongs_to :genre
+end
+
+app/models/movie.rb
+---
+class Movie < ActiveRecord::Base
+  has_many :ratings, dependent: :destroy
+  has_many :users, through: :ratings
+
+  has_many :actors_movies, dependent: :destroy
+  has_many :actors, through: :actors_movies
+
+  has_many :genres_movies, dependent: :destroy
+  has_many :genres, through: :genres_movies
+
+  has_many :directors_movies, dependent: :destroy
+  has_many :directors, through: :directors_movies
+
+  has_many :recommendations, dependent: :destroy
+  has_many :users, through: :recommendations
+
+  posify { title }
+end
+
+app/models/rating.rb
+---
+class Rating < ActiveRecord::Base
+  belongs_to :movie
+  belongs_to :user
+
+  validates_uniqueness_of :user_id, scope: :movie_id
+  validates :movie_id, :user_id, :rating_value, presence: true
+
+  validates :rating_value, numericality: {
+    greater_than_or_equal_to: 1, less_than_or_equal_to: 5
+  }
+
+  attr_accessible :movie_id, :rating_value
+end
+
+app/models/recommendation.rb
+---
+class Recommendation < ActiveRecord::Base
+  belongs_to :user
+  belongs_to :movie
+
+  validates_uniqueness_of :user_id, scope: :movie_id
+  validates :user_id, :movie_id, presence: true
+end
+
+app/models/user.rb
+---
+class User < ActiveRecord::Base
+  devise :database_authenticatable, :registerable,
+         :recoverable, :rememberable, :trackable, :validatable
+
+  attr_accessible :password_confirmation, :name, :email, :password
+
+  has_many :ratings, dependent: :destroy
+  has_many :movies, through: :ratings
+
+  has_many :recommendations, dependent: :destroy
+  has_many :movies, through: :recommendations
+
+  def unrated_recommendations
+    recommendations.where.not(movie_id: ratings.pluck(:movie_id))
+  end
+
+  # Find the user's closest user using PearsonCorrelation
+  def closest_user
+    users = User.includes(ratings: :movie)
+
+    result = [users.first.id, pearson_correlation(users.first)]
+
+    users.each do |user|
+      next if user.id == self.id
+      current_pearson_correlation = pearson_correlation(user)
+
+      if (1 - current_pearson_correlation).abs < (1 - result.last).abs
+        result = [user, current_pearson_correlation]
+      end
+    end
+    result[1] == 0 ? nil : result[0]
+  end
+
+  def movie_rating_pairs
+    ratings.pluck(:movie_id, :rating_value).to_h
+  end
+
+  private
+
+  def pearson_correlation(other_user)
+    PearsonCorrelation.new(self, other_user).calculate
+  end
+end
+
+app/services/pearson_correlation.rb
+---
+# Calculates the distance between two users. The pearson correlation coefficient
+class PearsonCorrelation
+
+  attr_reader :user_ratings, :user_rating_average,
+              :other_user_ratings, :other_user_rating_average
+
+  def initialize(user, other_user)
+    @user_ratings = user.movie_rating_pairs
+    @other_user_ratings = other_user.movie_rating_pairs
+    @user_rating_average = rating_average(user_ratings)
+    @other_user_rating_average = rating_average(other_user_ratings)
+  end
+
+  def calculate
+    return 0 if shared_movie_ids.empty?
+
+    deviation / denominator
+  end
+
+  private
+
+  def denominator
+    Math.sqrt(square_of_user_ratings * square_of_other_user_ratings).to_f
+  end
+
+  def deviation
+    shared_movie_ids.inject(0) do |sum, movie_id|
+      target = user_ratings[movie_id] - user_rating_average
+      other = other_user_ratings[movie_id] - other_user_rating_average
+      sum + (target * other)
+    end.to_f
+  end
+
+  def rating_average(ratings)
+    user_rating_sum = ratings.values.sum
+    return 0 if shared_movie_ids.size.zero?
+    user_rating_sum / shared_movie_ids.size
+  end
+
+  def shared_movie_ids
+    @shared_movie_ids ||= user_ratings.keys & other_user_ratings.keys
+  end
+
+  def square_of(ratings, average)
+    shared_movie_ids.inject(0) do |sum, movie_id|
+      sum + ((ratings[movie_id] - average) ** 2)
+    end
+  end
+
+  def square_of_user_ratings
+    square_of(user_ratings, user_rating_average)
+  end
+
+  def square_of_other_user_ratings
+    square_of(other_user_ratings, other_user_rating_average)
+  end
+end
+
+app/services/recommendation_system.rb
+---
+class RecommendationSystem
+
+  attr_reader :current_user, :rated_movie, :rating_value, :already_rated_ids
+
+  def initialize(rating)
+    @current_user      = rating.user
+    @rating_value      = rating.rating_value.to_i
+    @rated_movie       = Movie.find(rating.movie_id)
+    @already_rated_ids = @current_user.ratings.pluck(:movie_id)
+  end
+
+  def update_recommendations
+    return if rating_value < 3
+    recommendations_from_closest_user = []
+
+    if closest_user
+      movies_to_rec = movies_from_closest_user
+      recommendations_from_closest_user = create_recommendations(movies_to_rec)
+    end
+
+    newly_rated_movie_cluster = unit_cluster(recommendations_from_closest_user)
+
+    # TODO: Hacer que esto sea el mismo metodo que create_recommendations.
+    #
+    # Hacer que create_recommendations tome otro parametro, que va a ser
+    # si la recomendacion es colaborativa o por contenido, que va a vivir en una
+    # columna nueva bajo la tabla de recomendaciones.
+    #
+    # Hacer que la recomendacion tenga otra columna nueva que va a ser un dato,
+    # el mail de la persona con la cual tenes el gusto en comun, si la rec fuese
+    # colaborativa, o la pelicula que origino la recomendacion si la rec es por
+    # contenido.
+    newly_rated_movie_cluster.each do |new_movie|
+      current_user.recommendations.create(movie_id: new_movie)
+    end
+  end
+
+  def create_recommendations(movie_ids)
+    movie_ids = movie_ids[0..collaborative_limit]
+    movie_ids.each { |id| current_user.recommendations.create(movie_id: id) }
+  end
+
+  def unit_cluster(total_recs = [])
+    directors = rated_movie.directors
+    actors    = rated_movie.actors
+    genres    = rated_movie.genres
+
+    directors_movies = entity_recommendation_list(directors, Director)
+    actors_movies    = entity_recommendation_list(actors, Actor)
+    genres_movies    = entity_recommendation_list(genres, Genre)
+
+    actor_director_genre_recs = directors_movies & actors_movies & genres_movies
+    actor_director_recs       = directors_movies & actors_movies
+    director_genre_recs       = directors_movies & genres_movies
+    actor_genre_recs          = genres_movies & actors_movies
+
+    populate_recommendation_list(actor_director_genre_recs, total_recs)
+    populate_recommendation_list(actor_director_recs, total_recs)
+    populate_recommendation_list(director_genre_recs, total_recs)
+    populate_recommendation_list(actor_genre_recs, total_recs)
+    populate_recommendation_list(directors_movies, total_recs)
+    populate_recommendation_list(actors_movies, total_recs)
+    populate_recommendation_list(genres_movies, total_recs)
+
+    total_recs.uniq
+  end
+
+  # Adds movies from clustering to recommendation list
+  # (there is a limit to the amount of movies added based on rating value
+  # of the target movie)
+  def populate_recommendation_list(chosen_list, total_recs)
+    return if recommendation_limit_reached?(total_recs)
+
+    chosen_list.each do |movie_id|
+      break if recommendation_limit_reached?(total_recs)
+      next if movie_id == rated_movie.id
+
+      total_recs << movie_id unless already_rated_ids.include? movie_id
+    end
+  end
+
+  private
+
+  def collaborative_limit
+    RECOMMENDATION_LIMITS[rating_value] * 0.6
+  end
+
+  def entity_recommendation_list(entities, klass)
+    entities.map do |entity|
+      klass.where(id: entity.id).includes(:movies).first.movies.pluck(:id)
+    end.flatten
+  end
+
+  def movies_from_closest_user
+    closest_user.ratings
+                .where("ratings.rating_value >= 3")
+                .where("ratings.movie_id not in (?)", already_rated_ids)
+                .pluck(:movie_id)
+  end
+
+  def recommendation_limit_reached?(total_recs)
+    total_recs.length >= RECOMMENDATION_LIMITS[rating_value]
+  end
+
+  def closest_user
+    @closest_user ||= current_user.closest_user
+  end
+end
+
+app/workers/update_recommendations_worker.rb
+---
+class UpdateRecommendationsWorker
+  include Sidekiq::Worker
+
+  def perform(rating_id)
+    rating = Rating.where(id: rating_id).first
+    RecommendationSystem.new(rating).update_recommendations
+  end
+
+end
+
+config/application.rb
+---
+require File.expand_path('../boot', __FILE__)
+
+require "rails/all"
+
+Bundler.require(*Rails.groups)
+
+module MovieRecommendations
+  class Application < Rails::Application
+    # Settings in config/environments/* take precedence over those specified here.
+    # Application configuration should go into files in config/initializers
+    # -- all .rb files in that directory are automatically loaded.
+
+    # Set Time.zone default to the specified zone and make Active Record auto-convert to this zone.
+    # Run "rake -D time" for a list of tasks for finding time zone names. Default is UTC.
+    # config.time_zone = 'Central Time (US & Canada)'
+
+    # The default locale is :en and all translations from config/locales/*.rb,yml are auto loaded.
+    # config.i18n.load_path += Dir[Rails.root.join('my', 'locales', '*.{rb,yml}').to_s]
+    # config.i18n.default_locale = :de
+
+    # Configure the default encoding used in templates for Ruby 1.9.
+    config.encoding = "utf-8"
+
+    # Configure sensitive parameters which will be filtered from the log file.
+    config.filter_parameters += [:password, :password_confirmation]
+
+    # Enable escaping HTML in JSON.
+    config.active_support.escape_html_entities_in_json = true
+
+    # Enable the asset pipeline
+    config.assets.enabled = true
+
+    # Version of your assets, change this if you want to expire all your assets
+    config.assets.version = '1.0'
+  end
+end
+
+config/boot.rb
+---
+require 'rubygems'
+
+# Set up gems listed in the Gemfile.
+ENV['BUNDLE_GEMFILE'] ||= File.expand_path('../../Gemfile', __FILE__)
+
+require 'bundler/setup' if File.exists?(ENV['BUNDLE_GEMFILE'])
+
+config/environment.rb
+---
+# Load the rails application
+require File.expand_path('../application', __FILE__)
+
+# Initialize the rails application
+MovieRecommendations::Application.initialize!
+
+config/environments/development.rb
+---
+MovieRecommendations::Application.configure do
+  # Settings specified here will take precedence over those in config/application.rb
+
+  # In the development environment your application's code is reloaded on
+  # every request. This slows down response time but is perfect for development
+  # since you don't have to restart the web server when you make code changes.
+  config.cache_classes = false
+
+  config.eager_load = false
+
+  # Show full error reports and disable caching
+  config.consider_all_requests_local       = true
+  config.action_controller.perform_caching = false
+
+  # ActionMailer Config
+  config.action_mailer.default_url_options = { :host => 'localhost:3000' }
+  config.action_mailer.delivery_method = :smtp
+  # change to true to allow email to be sent during development
+  config.action_mailer.perform_deliveries = false
+  config.action_mailer.raise_delivery_errors = true
+  config.action_mailer.default charset: "utf-8"
+
+  # Print deprecation notices to the Rails logger
+  config.active_support.deprecation = :log
+
+  # Only use best-standards-support built into browsers
+  config.action_dispatch.best_standards_support = :builtin
+
+  # Do not compress assets
+  config.assets.compress = false
+
+  # Expands the lines which load the assets
+  config.assets.debug = true
+
+  config.action_mailer.smtp_settings = {
+    address: "smtp.gmail.com",
+    port: 587,
+    domain: ENV["DOMAIN_NAME"],
+    authentication: "plain",
+    enable_starttls_auto: true,
+    user_name: ENV["GMAIL_USERNAME"],
+    password: ENV["GMAIL_PASSWORD"]
+  }
+
+end
+
+config/environments/production.rb
+---
+MovieRecommendations::Application.configure do
+  # Settings specified here will take precedence over those in config/application.rb
+
+  # Code is not reloaded between requests
+  config.cache_classes = true
+
+  config.eager_load = false
+
+  # Full error reports are disabled and caching is turned on
+  config.consider_all_requests_local       = false
+  config.action_controller.perform_caching = true
+
+  # Disable Rails's static asset server (Apache or nginx will already do this)
+  config.serve_static_assets = false
+
+  # Compress JavaScripts and CSS
+  config.assets.compress = true
+
+  # Don't fallback to assets pipeline if a precompiled asset is missed
+  config.assets.compile = false
+
+  # Generate digests for assets URLs
+  config.assets.digest = true
+
+  # Defaults to nil and saved in location specified by config.assets.prefix
+  # config.assets.manifest = YOUR_PATH
+
+  # Specifies the header that your server uses for sending files
+  # config.action_dispatch.x_sendfile_header = "X-Sendfile" # for apache
+  # config.action_dispatch.x_sendfile_header = 'X-Accel-Redirect' # for nginx
+
+  # Force all access to the app over SSL, use Strict-Transport-Security, and use secure cookies.
+  # config.force_ssl = true
+
+  # See everything in the log (default is :info)
+  # config.log_level = :debug
+
+  # Prepend all log lines with the following tags
+  # config.log_tags = [ :subdomain, :uuid ]
+
+  # Use a different logger for distributed setups
+  # config.logger = ActiveSupport::TaggedLogging.new(SyslogLogger.new)
+
+  # Use a different cache store in production
+  # config.cache_store = :mem_cache_store
+
+  # Enable serving of images, stylesheets, and JavaScripts from an asset server
+  # config.action_controller.asset_host = "http://assets.example.com"
+
+  # Precompile additional assets (application.js, application.css, and all non-JS/CSS are already added)
+  # config.assets.precompile += %w( search.js )
+
+  # Disable delivery errors, bad email addresses will be ignored
+  # config.action_mailer.raise_delivery_errors = false
+
+  # Enable threaded mode
+  # config.threadsafe!
+
+  # Enable locale fallbacks for I18n (makes lookups for any locale fall back to
+  # the I18n.default_locale when a translation can not be found)
+  config.i18n.fallbacks = true
+
+  # Send deprecation notices to registered listeners
+  config.active_support.deprecation = :notify
+
+  config.action_mailer.smtp_settings = {
+    address: "smtp.gmail.com",
+    port: 587,
+    domain: ENV["DOMAIN_NAME"],
+    authentication: "plain",
+    enable_starttls_auto: true,
+    user_name: ENV["GMAIL_USERNAME"],
+    password: ENV["GMAIL_PASSWORD"]
+  }
+
+  config.action_mailer.default_url_options = { :host => 'example.com' }
+  config.action_mailer.delivery_method = :smtp
+  config.action_mailer.perform_deliveries = true
+  config.action_mailer.raise_delivery_errors = false
+  config.action_mailer.default charset: "utf-8"
+end
+
+config/environments/test.rb
+---
+MovieRecommendations::Application.configure do
+  # Settings specified here will take precedence over those in config/application.rb
+
+  # The test environment is used exclusively to run your application's
+  # test suite. You never need to work with it otherwise. Remember that
+  # your test database is "scratch space" for the test suite and is wiped
+  # and recreated between test runs. Don't rely on the data there!
+  config.cache_classes = true
+
+  config.eager_load = false
+
+  # Configure static asset server for tests with Cache-Control for performance
+  config.serve_static_files = true
+  config.static_cache_control = "public, max-age=3600"
+
+  # Show full error reports and disable caching
+  config.consider_all_requests_local       = true
+  config.action_controller.perform_caching = false
+
+  # Raise exceptions instead of rendering exception templates
+  config.action_dispatch.show_exceptions = false
+
+  # Disable request forgery protection in test environment
+  config.action_controller.allow_forgery_protection    = false
+
+  # Tell Action Mailer not to deliver emails to the real world.
+  # The :test delivery method accumulates sent emails in the
+  # ActionMailer::Base.deliveries array.
+  config.action_mailer.delivery_method = :test
+
+  # Print deprecation notices to the stderr
+  config.active_support.deprecation = :stderr
+
+  # ActionMailer Config
+  config.action_mailer.default_url_options = { :host => 'example.com' }
+
+end
+
+config/initializers/backtrace_silencers.rb
+---
+# Be sure to restart your server when you modify this file.
+
+# You can add backtrace silencers for libraries that you're using but don't wish to see in your backtraces.
+# Rails.backtrace_cleaner.add_silencer { |line| line =~ /my_noisy_library/ }
+
+# You can also remove all the silencers if you're trying to debug a problem that might stem from framework code.
+# Rails.backtrace_cleaner.remove_silencers!
+
+config/initializers/constants.rb
+---
+RECOMMENDATION_LIMITS = { 3 => 10, 4 => 20, 5 => 30 }
+
+config/initializers/devise.rb
+---
+# Use this hook to configure devise mailer, warden hooks and so forth.
+# Many of these configuration options can be set straight in your model.
+Devise.setup do |config|
+  # ==> Mailer Configuration
+  # Configure the e-mail address which will be shown in Devise::Mailer,
+  # note that it will be overwritten if you use your own mailer class with default "from" parameter.
+  config.mailer_sender = "please-change-me-at-config-initializers-devise@example.com"
+
+  # Configure the class responsible to send e-mails.
+  # config.mailer = "Devise::Mailer"
+
+  # ==> ORM configuration
+  # Load and configure the ORM. Supports :active_record (default) and
+  # :mongoid (bson_ext recommended) by default. Other ORMs may be
+  # available as additional gems.
+  require 'devise/orm/active_record'
+
+  # ==> Configuration for any authentication mechanism
+  # Configure which keys are used when authenticating a user. The default is
+  # just :email. You can configure it to use [:username, :subdomain], so for
+  # authenticating a user, both parameters are required. Remember that those
+  # parameters are used only when authenticating and not when retrieving from
+  # session. If you need permissions, you should implement that in a before filter.
+  # You can also supply a hash where the value is a boolean determining whether
+  # or not authentication should be aborted when the value is not present.
+  # config.authentication_keys = [ :email ]
+
+  # Configure parameters from the request object used for authentication. Each entry
+  # given should be a request method and it will automatically be passed to the
+  # find_for_authentication method and considered in your model lookup. For instance,
+  # if you set :request_keys to [:subdomain], :subdomain will be used on authentication.
+  # The same considerations mentioned for authentication_keys also apply to request_keys.
+  # config.request_keys = []
+
+  # Configure which authentication keys should be case-insensitive.
+  # These keys will be downcased upon creating or modifying a user and when used
+  # to authenticate or find a user. Default is :email.
+  config.case_insensitive_keys = [ :email ]
+
+  # Configure which authentication keys should have whitespace stripped.
+  # These keys will have whitespace before and after removed upon creating or
+  # modifying a user and when used to authenticate or find a user. Default is :email.
+  config.strip_whitespace_keys = [ :email ]
+
+  # Tell if authentication through request.params is enabled. True by default.
+  # It can be set to an array that will enable params authentication only for the
+  # given strategies, for example, `config.params_authenticatable = [:database]` will
+  # enable it only for database (email + password) authentication.
+  # config.params_authenticatable = true
+
+  # Tell if authentication through HTTP Auth is enabled. False by default.
+  # It can be set to an array that will enable http authentication only for the
+  # given strategies, for example, `config.http_authenticatable = [:token]` will
+  # enable it only for token authentication. The supported strategies are:
+  # :database      = Support basic authentication with authentication key + password
+  # :token         = Support basic authentication with token authentication key
+  # :token_options = Support token authentication with options as defined in
+  #                  http://api.rubyonrails.org/classes/ActionController/HttpAuthentication/Token.html
+  # config.http_authenticatable = false
+
+  # If http headers should be returned for AJAX requests. True by default.
+  # config.http_authenticatable_on_xhr = true
+
+  # The realm used in Http Basic Authentication. "Application" by default.
+  # config.http_authentication_realm = "Application"
+
+  # It will change confirmation, password recovery and other workflows
+  # to behave the same regardless if the e-mail provided was right or wrong.
+  # Does not affect registerable.
+  # config.paranoid = true
+
+  # By default Devise will store the user in session. You can skip storage for
+  # :http_auth and :token_auth by adding those symbols to the array below.
+  # Notice that if you are skipping storage for all authentication paths, you
+  # may want to disable generating routes to Devise's sessions controller by
+  # passing :skip => :sessions to `devise_for` in your config/routes.rb
+  config.skip_session_storage = [:http_auth]
+
+  # ==> Configuration for :database_authenticatable
+  # For bcrypt, this is the cost for hashing the password and defaults to 10. If
+  # using other encryptors, it sets how many times you want the password re-encrypted.
+  #
+  # Limiting the stretches to just one in testing will increase the performance of
+  # your test suite dramatically. However, it is STRONGLY RECOMMENDED to not use
+  # a value less than 10 in other environments.
+  config.stretches = Rails.env.test? ? 1 : 10
+
+  # Setup a pepper to generate the encrypted password.
+  # config.pepper = "ab768c223c2f0ca947058ae1c221d87dec901b796f65a38b9de60540aa626fea431a11dda19223eb5944696613a3699eecf223e05fd8a084aac452d5827a4bf1"
+
+  # ==> Configuration for :confirmable
+  # A period that the user is allowed to access the website even without
+  # confirming his account. For instance, if set to 2.days, the user will be
+  # able to access the website for two days without confirming his account,
+  # access will be blocked just in the third day. Default is 0.days, meaning
+  # the user cannot access the website without confirming his account.
+  # config.allow_unconfirmed_access_for = 2.days
+
+  # A period that the user is allowed to confirm their account before their
+  # token becomes invalid. For example, if set to 3.days, the user can confirm
+  # their account within 3 days after the mail was sent, but on the fourth day
+  # their account can't be confirmed with the token any more.
+  # Default is nil, meaning there is no restriction on how long a user can take
+  # before confirming their account.
+  # config.confirm_within = 3.days
+
+  # If true, requires any email changes to be confirmed (exactly the same way as
+  # initial account confirmation) to be applied. Requires additional unconfirmed_email
+  # db field (see migrations). Until confirmed new email is stored in
+  # unconfirmed email column, and copied to email column on successful confirmation.
+  config.reconfirmable = true
+
+  # Defines which key will be used when confirming an account
+  # config.confirmation_keys = [ :email ]
+
+  # ==> Configuration for :rememberable
+  # The time the user will be remembered without asking for credentials again.
+  # config.remember_for = 2.weeks
+
+  # If true, extends the user's remember period when remembered via cookie.
+  # config.extend_remember_period = false
+
+  # Options to be passed to the created cookie. For instance, you can set
+  # :secure => true in order to force SSL only cookies.
+  # config.rememberable_options = {}
+
+  # ==> Configuration for :validatable
+  # Range for password length. Default is 8..128.
+  config.password_length = 8..128
+
+  # Email regex used to validate email formats. It simply asserts that
+  # one (and only one) @ exists in the given string. This is mainly
+  # to give user feedback and not to assert the e-mail validity.
+  # config.email_regexp = /\A[^@]+@[^@]+\z/
+
+  # ==> Configuration for :timeoutable
+  # The time you want to timeout the user session without activity. After this
+  # time the user will be asked for credentials again. Default is 30 minutes.
+  # config.timeout_in = 30.minutes
+
+  # If true, expires auth token on session timeout.
+  # config.expire_auth_token_on_timeout = false
+
+  # ==> Configuration for :lockable
+  # Defines which strategy will be used to lock an account.
+  # :failed_attempts = Locks an account after a number of failed attempts to sign in.
+  # :none            = No lock strategy. You should handle locking by yourself.
+  # config.lock_strategy = :failed_attempts
+
+  # Defines which key will be used when locking and unlocking an account
+  # config.unlock_keys = [ :email ]
+
+  # Defines which strategy will be used to unlock an account.
+  # :email = Sends an unlock link to the user email
+  # :time  = Re-enables login after a certain amount of time (see :unlock_in below)
+  # :both  = Enables both strategies
+  # :none  = No unlock strategy. You should handle unlocking by yourself.
+  # config.unlock_strategy = :both
+
+  # Number of authentication tries before locking an account if lock_strategy
+  # is failed attempts.
+  # config.maximum_attempts = 20
+
+  # Time interval to unlock the account if :time is enabled as unlock_strategy.
+  # config.unlock_in = 1.hour
+
+  # ==> Configuration for :recoverable
+  #
+  # Defines which key will be used when recovering the password for an account
+  # config.reset_password_keys = [ :email ]
+
+  # Time interval you can reset your password with a reset password key.
+  # Don't put a too small interval or your users won't have the time to
+  # change their passwords.
+  config.reset_password_within = 6.hours
+
+  # ==> Configuration for :encryptable
+  # Allow you to use another encryption algorithm besides bcrypt (default). You can use
+  # :sha1, :sha512 or encryptors from others authentication tools as :clearance_sha1,
+  # :authlogic_sha512 (then you should set stretches above to 20 for default behavior)
+  # and :restful_authentication_sha1 (then you should set stretches to 10, and copy
+  # REST_AUTH_SITE_KEY to pepper).
+  #
+  # Require the `devise-encryptable` gem when using anything other than bcrypt
+  # config.encryptor = :sha512
+
+  # ==> Configuration for :token_authenticatable
+  # Defines name of the authentication token params key
+  # config.token_authentication_key = :auth_token
+
+  # ==> Scopes configuration
+  # Turn scoped views on. Before rendering "sessions/new", it will first check for
+  # "users/sessions/new". It's turned off by default because it's slower if you
+  # are using only default views.
+  # config.scoped_views = false
+
+  # Configure the default scope given to Warden. By default it's the first
+  # devise role declared in your routes (usually :user).
+  # config.default_scope = :user
+
+  # Set this configuration to false if you want /users/sign_out to sign out
+  # only the current scope. By default, Devise signs out all scopes.
+  # config.sign_out_all_scopes = true
+
+  # ==> Navigation configuration
+  # Lists the formats that should be treated as navigational. Formats like
+  # :html, should redirect to the sign in page when the user does not have
+  # access, but formats like :xml or :json, should return 401.
+  #
+  # If you have any extra navigational formats, like :iphone or :mobile, you
+  # should add them to the navigational formats lists.
+  #
+  # The "*/*" below is required to match Internet Explorer requests.
+  # config.navigational_formats = ["*/*", :html]
+
+  # The default HTTP method used to sign out a resource. Default is :delete.
+  config.sign_out_via = Rails.env.test? ? :get : :delete
+
+  # ==> OmniAuth
+  # Add a new OmniAuth provider. Check the wiki for more information on setting
+  # up on your models and hooks.
+  # config.omniauth :github, 'APP_ID', 'APP_SECRET', :scope => 'user,public_repo'
+
+  # ==> Warden configuration
+  # If you want to use other strategies, that are not supported by Devise, or
+  # change the failure app, you can configure them inside the config.warden block.
+  #
+  # config.warden do |manager|
+  #   manager.intercept_401 = false
+  #   manager.default_strategies(:scope => :user).unshift :some_external_strategy
+  # end
+
+  # ==> Mountable engine configurations
+  # When using Devise inside an engine, let's call it `MyEngine`, and this engine
+  # is mountable, there are some extra configurations to be taken into account.
+  # The following options are available, assuming the engine is mounted as:
+  #
+  #     mount MyEngine, at: "/my_engine"
+  #
+  # The router that invoked `devise_for`, in the example above, would be:
+  # config.router_name = :my_engine
+  #
+  # When using omniauth, Devise cannot automatically set Omniauth path,
+  # so you need to do it manually. For the users scope, it would be:
+  # config.omniauth_path_prefix = "/my_engine/users/auth"
+end
+
+config/initializers/inflections.rb
+---
+# Be sure to restart your server when you modify this file.
+
+# Add new inflection rules using the following format
+# (all these examples are active by default):
+# ActiveSupport::Inflector.inflections do |inflect|
+#   inflect.plural /^(ox)$/i, '\1en'
+#   inflect.singular /^(ox)en/i, '\1'
+#   inflect.irregular 'person', 'people'
+#   inflect.uncountable %w( fish sheep )
+# end
+#
+# These inflection rules are supported but not enabled by default:
+# ActiveSupport::Inflector.inflections do |inflect|
+#   inflect.acronym 'RESTful'
+# end
+
+config/initializers/mime_types.rb
+---
+# Be sure to restart your server when you modify this file.
+
+# Add new mime types for use in respond_to blocks:
+# Mime::Type.register "text/richtext", :rtf
+# Mime::Type.register_alias "text/html", :iphone
+
+config/initializers/secret_token.rb
+---
+# Be sure to restart your server when you modify this file.
+
+# Your secret key for verifying the integrity of signed cookies.
+# If you change this key, all old signed cookies will become invalid!
+# Make sure the secret is at least 30 characters and all random,
+# no regular words or you'll be exposed to dictionary attacks.
+MovieRecommendations::Application.config.secret_token = '5211d5b8d3df0bdd5c0da37d682b0c7b3cdd126b883bd40977d0207ed6b1a792ced08ff7fe07fe5e54125e730e2e777af13d251c9ab40dd03c6e04a9305cb0a1'
+MovieRecommendations::Application.config.secret_key_base = 'b769e938a127e93c07e6bca044df61eefa0349c247b5c278ccc1d0495741e9261f63cc28911027876269a74227825a94f69c58620bc2c584b48a492ba9f32d40'
+
+config/initializers/session_store.rb
+---
+# Be sure to restart your server when you modify this file.
+
+MovieRecommendations::Application.config.session_store :cookie_store, key: '_recommendation_system_session'
+
+# Use the database for sessions instead of the cookie-based default,
+# which shouldn't be used to store highly confidential information
+# (create the session table with "rails generate session_migration")
+# MovieRecommendations::Application.config.session_store :active_record_store
+
+config/initializers/wrap_parameters.rb
+---
+# Be sure to restart your server when you modify this file.
+#
+# This file contains settings for ActionController::ParamsWrapper which
+# is enabled by default.
+
+# Enable parameter wrapping for JSON. You can disable this by setting :format to an empty array.
+ActiveSupport.on_load(:action_controller) do
+  wrap_parameters format: [:json]
+end
+
+config/routes.rb
+---
+MovieRecommendations::Application.routes.draw do
+	devise_for :users
+
+	root to: 'home#index'
+
+	resources :recommendations, only: [:index]
+	resources :ratings, only: [:index, :create, :update]
+
+	get '/search' => 'ratings#search', as: 'search'
+	get '/users/ratings' => 'users#ratings', as: 'user_ratings'
+
+end
+
+db/migrate/20130726021826_devise_create_users.rb
+---
+class DeviseCreateUsers < ActiveRecord::Migration
+  def change
+    create_table(:users) do |t|
+      ## Database authenticatable
+      t.string :email,              :null => false, :default => ""
+      t.string :encrypted_password, :null => false, :default => ""
+
+      ## Recoverable
+      t.string   :reset_password_token
+      t.datetime :reset_password_sent_at
+
+      ## Rememberable
+      t.datetime :remember_created_at
+
+      ## Trackable
+      t.integer  :sign_in_count, :default => 0
+      t.datetime :current_sign_in_at
+      t.datetime :last_sign_in_at
+      t.string   :current_sign_in_ip
+      t.string   :last_sign_in_ip
+
+      ## Confirmable
+      # t.string   :confirmation_token
+      # t.datetime :confirmed_at
+      # t.datetime :confirmation_sent_at
+      # t.string   :unconfirmed_email # Only if using reconfirmable
+
+      ## Lockable
+      # t.integer  :failed_attempts, :default => 0 # Only if lock strategy is :failed_attempts
+      # t.string   :unlock_token # Only if unlock strategy is :email or :both
+      # t.datetime :locked_at
+
+      ## Token authenticatable
+      # t.string :authentication_token
+
+
+      t.timestamps
+    end
+
+    add_index :users, :email,                :unique => true
+    add_index :users, :reset_password_token, :unique => true
+    # add_index :users, :confirmation_token,   :unique => true
+    # add_index :users, :unlock_token,         :unique => true
+    # add_index :users, :authentication_token, :unique => true
+  end
+end
+
+db/migrate/20130726021831_add_name_to_users.rb
+---
+class AddNameToUsers < ActiveRecord::Migration
+  def change
+    add_column :users, :name, :string
+  end
+end
+
+db/migrate/20130726021840_rolify_create_roles.rb
+---
+class RolifyCreateRoles < ActiveRecord::Migration
+  def change
+    create_table(:roles) do |t|
+      t.string :name
+      t.references :resource, :polymorphic => true
+
+      t.timestamps
+    end
+
+    create_table(:users_roles, :id => false) do |t|
+      t.references :user
+      t.references :role
+    end
+
+    add_index(:roles, :name)
+    add_index(:roles, [ :name, :resource_type, :resource_id ])
+    add_index(:users_roles, [ :user_id, :role_id ])
+  end
+end
+
+db/migrate/20130726034824_create_movies.rb
+---
+class CreateMovies < ActiveRecord::Migration
+  def change
+    create_table :movies do |t|
+      t.string :title
+      t.integer :rt_id
+      t.integer :tmdb_id
+      t.string :imdb_ref
+      t.integer :tmdb_rating
+      t.date :release_date
+      t.string :critic_consensus
+      t.integer :rt_score
+      t.string :poster_url
+      t.string :trailer_url
+      t.string :mpaa_rating
+      t.integer :run_time
+      t.integer :budget
+      t.timestamps
+    end
+  end
+end
+
+db/migrate/20130726034908_create_actors.rb
+---
+class CreateActors < ActiveRecord::Migration
+  def change
+    create_table :actors do |t|
+      t.string :name
+      t.timestamps
+    end
+  end
+end
+
+db/migrate/20130726034925_create_actors_movies.rb
+---
+class CreateActorsMovies < ActiveRecord::Migration
+  def change
+    create_table :actors_movies do |t|
+      t.belongs_to :movie
+      t.belongs_to :actor
+      t.timestamps
+    end
+  end
+end
+
+db/migrate/20130726034946_create_directors.rb
+---
+class CreateDirectors < ActiveRecord::Migration
+  def change
+    create_table :directors do |t|
+      t.string :name
+      t.timestamps
+    end
+  end
+end
+
+db/migrate/20130726035002_create_genres.rb
+---
+class CreateGenres < ActiveRecord::Migration
+  def change
+    create_table :genres do |t|
+      t.string :name
+      t.timestamps
+    end
+  end
+end
+
+db/migrate/20130726035052_create_genres_movies.rb
+---
+class CreateGenresMovies < ActiveRecord::Migration
+  def change
+    create_table :genres_movies do |t|
+      t.belongs_to :genre
+      t.belongs_to :movie
+      t.timestamps
+    end
+  end
+end
+
+db/migrate/20130726035104_create_ratings.rb
+---
+class CreateRatings < ActiveRecord::Migration
+  def change
+    create_table :ratings do |t|
+      t.belongs_to :movie
+      t.belongs_to :user
+      t.float :rating_value
+      t.boolean :viewable, default: true
+      t.timestamps
+    end
+  end
+end
+
+db/migrate/20130726173136_create_recommendations.rb
+---
+class CreateRecommendations < ActiveRecord::Migration
+  def change
+    create_table :recommendations do |t|
+      t.references :user
+      t.references :movie
+    end
+    
+  end
+
+end
+
+db/migrate/20130726211324_create_directors_movies.rb
+---
+class CreateDirectorsMovies < ActiveRecord::Migration
+  def change
+    create_table :directors_movies do |t|
+      t.references :director
+      t.references :movie
+    end
+
+  end
+end
+
+db/migrate/20130728011106_add_index_to_ratings.rb
+---
+class AddIndexToRatings < ActiveRecord::Migration
+  def change
+    add_index :ratings, :movie_id
+    add_index :ratings, :rating_value
+    add_index :ratings, :user_id
+  end
+end
+
+db/migrate/20130729193544_install_pose.rb
+---
+class InstallPose < ActiveRecord::Migration
+
+  def self.up
+    create_table "pose_assignments" do |t|
+      t.integer "word_id",            null: false
+      t.integer "posable_id",              null: false
+      t.string  "posable_type", limit: 40, null: false
+    end
+
+    add_index "pose_assignments", :word_id
+    add_index "pose_assignments", :posable_id
+
+    create_table "pose_words" do |t|
+      t.string "text", limit: 80, null: false
+    end
+
+    add_index "pose_words", :text
+  end
+
+  def self.down
+    drop_table 'pose_assignments'
+    drop_table 'pose_words'
+  end
+end
+
+db/migrate/20130731194122_add_demo_column.rb
+---
+class AddDemoColumn < ActiveRecord::Migration
+  def change
+    add_column :movies, :demo_display, :boolean
+  end
+end
+
+db/schema.rb
+---
+# encoding: UTF-8
+# This file is auto-generated from the current state of the database. Instead
+# of editing this file, please use the migrations feature of Active Record to
+# incrementally modify your database, and then regenerate this schema definition.
+#
+# Note that this schema.rb definition is the authoritative source for your
+# database schema. If you need to create the application database on another
+# system, you should be using db:schema:load, not running all the migrations
+# from scratch. The latter is a flawed and unsustainable approach (the more migrations
+# you'll amass, the slower it'll run and the greater likelihood for issues).
+#
+# It's strongly recommended to check this file into your version control system.
+
+ActiveRecord::Schema.define(:version => 20130731194122) do
+
+  create_table "actors", :force => true do |t|
+    t.string   "name"
+    t.datetime "created_at", :null => false
+    t.datetime "updated_at", :null => false
+  end
+
+  create_table "actors_movies", :force => true do |t|
+    t.integer  "movie_id"
+    t.integer  "actor_id"
+    t.datetime "created_at", :null => false
+    t.datetime "updated_at", :null => false
+  end
+
+  create_table "directors", :force => true do |t|
+    t.string   "name"
+    t.datetime "created_at", :null => false
+    t.datetime "updated_at", :null => false
+  end
+
+  create_table "directors_movies", :force => true do |t|
+    t.integer "director_id"
+    t.integer "movie_id"
+  end
+
+  create_table "genres", :force => true do |t|
+    t.string   "name"
+    t.datetime "created_at", :null => false
+    t.datetime "updated_at", :null => false
+  end
+
+  create_table "genres_movies", :force => true do |t|
+    t.integer  "genre_id"
+    t.integer  "movie_id"
+    t.datetime "created_at", :null => false
+    t.datetime "updated_at", :null => false
+  end
+
+  create_table "movies", :force => true do |t|
+    t.string   "title"
+    t.integer  "rt_id"
+    t.integer  "tmdb_id"
+    t.string   "imdb_ref"
+    t.integer  "tmdb_rating"
+    t.date     "release_date"
+    t.string   "critic_consensus"
+    t.integer  "rt_score"
+    t.string   "poster_url"
+    t.string   "trailer_url"
+    t.string   "mpaa_rating"
+    t.integer  "run_time"
+    t.integer  "budget"
+    t.datetime "created_at",       :null => false
+    t.datetime "updated_at",       :null => false
+    t.boolean  "demo_display"
+  end
+
+  create_table "pose_assignments", :force => true do |t|
+    t.integer "word_id",                    :null => false
+    t.integer "posable_id",                 :null => false
+    t.string  "posable_type", :limit => 40, :null => false
+  end
+
+  add_index "pose_assignments", ["posable_id"], :name => "index_pose_assignments_on_posable_id"
+  add_index "pose_assignments", ["word_id"], :name => "index_pose_assignments_on_word_id"
+
+  create_table "pose_words", :force => true do |t|
+    t.string "text", :limit => 80, :null => false
+  end
+
+  add_index "pose_words", ["text"], :name => "index_pose_words_on_text"
+
+  create_table "ratings", :force => true do |t|
+    t.integer  "movie_id"
+    t.integer  "user_id"
+    t.float    "rating_value"
+    t.boolean  "viewable",     :default => true
+    t.datetime "created_at",                     :null => false
+    t.datetime "updated_at",                     :null => false
+  end
+
+  add_index "ratings", ["movie_id"], :name => "index_ratings_on_movie_id"
+  add_index "ratings", ["rating_value"], :name => "index_ratings_on_rating_value"
+  add_index "ratings", ["user_id"], :name => "index_ratings_on_user_id"
+
+  create_table "recommendations", :force => true do |t|
+    t.integer "user_id"
+    t.integer "movie_id"
+  end
+
+  create_table "roles", :force => true do |t|
+    t.string   "name"
+    t.integer  "resource_id"
+    t.string   "resource_type"
+    t.datetime "created_at",    :null => false
+    t.datetime "updated_at",    :null => false
+  end
+
+  add_index "roles", ["name", "resource_type", "resource_id"], :name => "index_roles_on_name_and_resource_type_and_resource_id"
+  add_index "roles", ["name"], :name => "index_roles_on_name"
+
+  create_table "users", :force => true do |t|
+    t.string   "email",                  :default => "", :null => false
+    t.string   "encrypted_password",     :default => "", :null => false
+    t.string   "reset_password_token"
+    t.datetime "reset_password_sent_at"
+    t.datetime "remember_created_at"
+    t.integer  "sign_in_count",          :default => 0
+    t.datetime "current_sign_in_at"
+    t.datetime "last_sign_in_at"
+    t.string   "current_sign_in_ip"
+    t.string   "last_sign_in_ip"
+    t.datetime "created_at",                             :null => false
+    t.datetime "updated_at",                             :null => false
+    t.string   "name"
+  end
+
+  add_index "users", ["email"], :name => "index_users_on_email", :unique => true
+  add_index "users", ["reset_password_token"], :name => "index_users_on_reset_password_token", :unique => true
+
+  create_table "users_roles", :id => false, :force => true do |t|
+    t.integer "user_id"
+    t.integer "role_id"
+  end
+
+  add_index "users_roles", ["user_id", "role_id"], :name => "index_users_roles_on_user_id_and_role_id"
+
+end
+
+db/seeds.rb
+---
+# This file should contain all the record creation needed to seed the database with its default values.
+# The data can then be loaded with the rake db:seed (or created alongside the db with db:setup).
+#
+# Examples:
+#
+#   cities = City.create([{ name: 'Chicago' }, { name: 'Copenhagen' }])
+#   Mayor.create(name: 'Emanuel', city: cities.first)
+# Environment variables (ENV['...']) can be set in the file config/application.yml.
+# See http://railsapps.github.io/rails-environment-variables.html
+
+spec/controllers/home_controller_spec.rb
+---
+require 'spec_helper'
+
+describe HomeController do
+
+  describe "GET 'index'" do
+    it "should be successful" do
+      get 'index'
+      response.should be_success
+    end
+  end
+
+end
+
+spec/factories/movies.rb
+---
+FactoryGirl.define do
+
+  factory :actor do
+    sequence(:name) {|n| "Actor#{n}" }
+  end
+
+  factory :director do
+    sequence(:name) {|n| "Director#{n}" }
+  end
+
+  factory :genre do
+    sequence(:name) {|n| "Genre#{n}" }
+  end
+
+  factory :movie do
+    title { Faker::Company.name }
+
+    trait :with_actor_director_and_genre do
+      actors { [FactoryGirl.create(:actor)] }
+      directors { [FactoryGirl.create(:director)] }
+      genres { [FactoryGirl.create(:genre)] }
+    end
+  end
+
+end
+
+spec/factories/ratings.rb
+---
+FactoryGirl.define do
+  factory :rating do
+    movie_id 1
+    user_id 1
+    rating_value 5
+  end
+  
+end
+
+spec/factories/recommendation.rb
+---
+FactoryGirl.define do
+  factory :recommendation do
+    movie_id 1
+    user_id 1
+  end
+end
+
+spec/factories/users.rb
+---
+FactoryGirl.define do
+  factory :user do
+    sequence(:name) {|n| "person#{n}" }
+    sequence(:email) {|n| "person#{n}@example.com" }
+    password '123456789'
+    password_confirmation '123456789'
+  end
+end
+
+spec/models/actor_spec.rb
+---
+require 'spec_helper'
+
+describe Actor do
+
+  before (:each) do
+    @actor = FactoryGirl.build(:actor)
+  end
+
+  describe "validations" do
+    it "should save with a valid name" do
+      @actor.save
+      expect(Actor.count).to eq(1)
+    end
+
+    it "should not save with empty name field" do 
+      @actor.name = ""
+      @actor.save
+      expect(Actor.count).to eq(0)
+    end
+  end
+
+end
+
+spec/models/director_spec.rb
+---
+require 'spec_helper'
+
+describe Director do
+
+  before(:each) do
+    @director = FactoryGirl.build(:director)
+  end
+
+  describe "validations" do
+    it "should save with a valid name" do
+      @director.save
+      expect(Director.count).to eq(1)
+    end
+
+    it "should not save with empty name field" do
+      @director.name = ""
+      @director.save
+      expect(Director.count).to eq(0)
+    end
+  end
+
+end
+
+spec/models/genre_spec.rb
+---
+require 'spec_helper'
+
+describe Genre do
+
+  before (:each) do
+    @genre = FactoryGirl.build(:genre)
+  end
+
+  describe "validations" do
+    it "should save with a valid name" do
+      @genre.save
+      expect(Genre.count).to eq(1)
+    end
+
+    it "should not save with empty name field" do 
+      @genre.name = ""
+      @genre.save
+      expect(Genre.count).to eq(0)
+    end
+  end
+
+end
+
+spec/models/movie_spec.rb
+---
+require 'spec_helper'
+
+describe Movie do
+  describe "validations" do 
+    before (:each) do
+      @movie = FactoryGirl.build(:movie)
+    end      
+  end
+end
+
+
+spec/models/rating_spec.rb
+---
+require 'spec_helper'
+
+describe Rating do
+
+  describe "validations" do
+    before (:each) do
+      @rating = FactoryGirl.build(:rating)
+    end
+
+    it "should save with a valid rating" do
+      @rating.save
+      expect(Rating.count).to eq(1)
+    end
+
+    it "should not save with empty rating_value field" do 
+      @rating.rating_value = nil
+      @rating.save
+      expect(Rating.count).to eq(0)
+    end
+
+    it "should not save with empty movie_id field" do 
+      @rating.movie_id = nil
+      @rating.save
+      expect(Rating.count).to eq(0)
+    end
+
+    it "should not save with empty user_id field" do 
+      @rating.user_id = nil
+      @rating.save
+      expect(Rating.count).to eq(0)
+    end
+
+    it "should not save with a rating value below 1" do
+      @rating.rating_value = 0
+      @rating.save
+      expect(Rating.count).to eq(0)
+    end
+
+    it "should not save with a rating value over 5" do 
+      @rating.rating_value = 6
+      @rating.save
+      expect(Rating.count).to eq(0)
+    end
+
+    it "should not save if the movie_id and user_id are the same as one in the DB" do 
+      FactoryGirl.create(:rating)
+      @rating.save
+      expect(Rating.count).to eq(1)
+    end
+
+    it "should allow a rating to be updated" do 
+      @rating.save
+      @rating.rating_value = 3
+      @rating.save
+      expect(Rating.find(1).rating_value).to eq(3)
+    end
+
+    it "should not allow a rating to be updated if rating_value is above 5" do 
+      @rating.save
+      @rating.rating_value = 6
+      @rating.save
+      expect(Rating.find(1).rating_value).to eq(5)
+    end
+
+    it "should not allow a rating to be updated if rating_value is below 0" do 
+      @rating.save
+      @rating.rating_value = 0
+      @rating.save
+      expect(Rating.find(1).rating_value).to eq(5)
+    end
+  end
+
+end
+
+spec/models/recommendation_spec.rb
+---
+require 'spec_helper'
+
+describe Recommendation do
+
+  describe "validations" do
+    before(:each) do
+      @recommendation = FactoryGirl.build(:recommendation)
+    end
+
+    it "should save with valid information" do
+      @recommendation.save
+      expect(Recommendation.count).to eq(1)
+    end
+
+    it "should not save without a movie_id" do
+      @recommendation.movie_id = nil
+      @recommendation.save
+      expect(Recommendation.count).to eq(0)
+    end
+
+    it "should not save without a user_id" do
+      @recommendation.user_id = nil
+      @recommendation.save
+      expect(Recommendation.count).to eq(0)
+    end
+
+    it "should not allow a movie to be recommended twice" do
+      @recommendation.save
+      expect { FactoryGirl.create(:recommendation) }.to raise_error
+    end
+  end
+
+end
+
+spec/models/user_spec.rb
+---
+require 'spec_helper'
+
+describe User do
+  let(:user_attrs) do
+    {
+      name: "Example User",
+      email: "user@example.com",
+      password: "changeme",
+      password_confirmation: "changeme" 
+    }
+  end
+
+  it "should create a new instance given a valid attribute" do
+    user = User.new(user_attrs)
+    expect do
+      user.save
+    end.to change(User, :count).by(1)
+  end
+
+  it "should require an email address" do
+    no_email_user = User.new(user_attrs.merge(email: ""))
+    expect(no_email_user).not_to be_valid
+  end
+
+  it "should accept valid email addresses" do
+    addresses = %w[user@foo.foo user@foo.bar user@foo.baz]
+    addresses.each do |address|
+      valid_email_user = User.new(user_attrs.merge(email: address))
+      expect(valid_email_user).to be_valid
+    end
+  end
+
+  it "should reject invalid email addresses" do
+    addresses = %w[user@foo,bar user.foo foo@bar.]
+    addresses.each do |address|
+      invalid_email_user = User.new(user_attrs.merge(email: address))
+      expect(invalid_email_user).to be_valid
+    end
+  end
+
+  it "should reject duplicate email addresses" do
+    FactoryGirl.create(:user, user_attrs)
+    user_with_duplicate_email = User.new(user_attrs)
+    expect(user_with_duplicate_email).not_to be_valid
+  end
+
+  it "should reject email addresses identical up to case" do
+    upcased_email = user_attrs[:email].upcase
+    FactoryGirl.create(:user, user_attrs.merge(email: upcased_email))
+    user_with_duplicate_email = User.new(user_attrs)
+    expect(user_with_duplicate_email).not_to be_valid
+  end
+
+  describe "passwords" do
+    let(:user) { User.new(user_attrs) }
+
+    it "should have a password attribute" do
+      expect(user).to respond_to(:password)
+    end
+
+    it "should have a password confirmation attribute" do
+      expect(user).to respond_to(:password_confirmation)
+    end
+  end
+
+  describe "password validations" do
+    it "should require a password" do
+      user = User.new(user_attrs.merge(password: "", password_confirmation: ""))
+      expect(user).not_to be_valid
+    end
+
+    it "should require a matching password confirmation" do
+      user = User.new(user_attrs.merge(password_confirmation: "invalid"))
+      expect(user).not_to be_valid
+    end
+
+    it "should reject short passwords" do
+      short = "a" * 5
+      hash = user_attrs.merge(password: short, password_confirmation: short)
+      user = User.new(hash)
+      expect(user).not_to be_valid
+    end
+  end
+
+  describe "password encryption" do
+    let(:user) { FactoryGirl.create(:user, user_attrs) }
+
+    it "should have an encrypted password attribute" do
+      expect(user).to respond_to(:encrypted_password)
+    end
+
+    it "should set the encrypted password attribute" do
+      expect(user.encrypted_password).not_to be_blank
+    end
+  end
+end
+
+spec/requests/login_spec.rb
+---
+require 'spec_helper'
+
+describe "User session integration tests", js: true do
+
+  let!(:user) { FactoryGirl.create(:user)  }
+
+  it "user can create a new account" do
+    visit new_user_registration_path
+    fill_in "Email", with: user.email
+    fill_in "Password", with: user.password
+    fill_in "Password confirmation", with: user.password_confirmation
+    click_button "Sign up"
+    expect(page).to have_text("Logout")
+    expect(page).to have_text("Please rate more movies to receive recommendations!")
+  end
+
+  it "user cannot create account if password is not confirmed" do
+    visit new_user_registration_path
+    fill_in "Email", with: user.email
+    fill_in "Password", with: user.password
+    click_button "Sign up"
+    expect(page).to have_text("Sign up")
+  end
+
+  it "User can login and start session" do
+    visit new_user_session_path
+    expect(page).to have_text("Sign in")
+    expect(page).to have_text("Email")
+    expect(page).to have_text("Password")
+    expect(page).to have_text("Sign up")
+    fill_in "Email", with: user.email
+    fill_in "Password", with: user.password
+    click_button "Sign in"
+    expect(page).to have_content 'Recommendations'
+  end
+
+  it "User can't start session with wrong password" do
+    visit new_user_session_path
+    expect(page).to have_text("Sign in")
+    expect(page).to have_text("Email")
+    expect(page).to have_text("Password")
+    expect(page).to have_text("Sign up")
+    fill_in "Email", with: user.email
+    fill_in "Password", with: 'fake-password'
+    click_button "Sign in"
+    expect(page).to have_content 'Invalid email or password.'
+  end
+
+  it "User can't begin session with wrong email" do
+    visit new_user_session_path
+    expect(page).to have_text("Sign in")
+    expect(page).to have_text("Email")
+    expect(page).to have_text("Password")
+    expect(page).to have_text("Sign up")
+    fill_in "Email", with: 'fake-email@fake.com'
+    fill_in "Password", with: 'fake-password'
+    click_button "Sign in"
+    expect(page).to have_content 'Invalid email or password.'
+  end
+
+  it "User can log out when they have an active session" do
+    login(user)
+    visit destroy_user_session_path
+    expect(page).to have_text("Signed out successfully.")
+  end
+
+  it "User can update their email" do
+    login(user)
+    visit edit_user_registration_path
+    fill_in "Name", with: user.name
+    fill_in "Email", with: user.email
+    fill_in "Password", with: user.password
+    fill_in "Password", with: user.password_confirmation
+    click_button "Update"
+    expect(page).to have_text("Recommendations")
+  end
+
+  it "User can cancel their account" do
+    login(user)
+    visit edit_user_registration_path
+    click_link('Cancel my account')
+    alert = page.driver.browser.switch_to.alert
+    alert.accept
+    expect(page).to have_text("Bye! Your account was successfully cancelled. We hope to see you again soon.")
+  end
+
+end
+
+spec/requests/user_ratings_spec.rb
+---
+require 'spec_helper'
+
+describe "User ratings integration tests", js: true do
+
+  let!(:user) { FactoryGirl.create(:user)  }
+
+  before(:each) do
+    login(user)
+  end
+
+  it "user can see their ratings page" do
+    visit user_ratings_path
+    element = find('a.selected')
+    element[:href].ends_with?("/users/ratings").should be_true
+  end
+end
+
+spec/requests/user_recs_spec.rb
+---
+require 'spec_helper'
+
+describe "User recommendations integration tests" do
+
+  it "user can see their recommendations page" do
+    visit recommendations_path
+    expect(page).to have_text("Recommendations")
+  end
+
+end
+
+spec/requests/user_search_spec.rb
+---
+require 'spec_helper'
+
+describe "User search bar integration tests", js: true do
+
+  let!(:user) { FactoryGirl.create(:user)  }
+
+  before(:each) do
+    login(user)
+  end
+
+  it "user can see the search bar on every page except 'Edit User' " do
+    visit recommendations_path
+    expect(page).to have_text("Search")
+
+    visit user_ratings_path
+    expect(page).to have_text("Search")
+
+    visit edit_user_registration_path
+    expect(page).to_not have_text("Search")
+  end
+
+end
+
+spec/requests/visitor_spec.rb
+---
+require 'spec_helper'
+
+describe "Visitor (unauthenticated user) integration behavior", js: true do 
+
+  it "unauthenticated user cannot see ratings page" do
+    visit ratings_path
+    expect(page).to have_text("You need to sign in or sign up before continuing.")
+  end
+
+  it "unauthenticated user cannot see user ratings page" do
+    visit ratings_path
+    expect(page).to have_text("You need to sign in or sign up before continuing.")
+  end
+
+  it "unauthenticated user cannot see recommendations page" do
+    visit ratings_path
+    expect(page).to have_text("You need to sign in or sign up before continuing.")
+  end
+
+  it "unauthenticated user cannot see search bar" do 
+    visit root_path
+    expect(page).to_not have_text("Search")
+  end
+
+end
+
+spec/services/pearson_correlation_spec.rb
+---
+require 'spec_helper'
+
+describe PearsonCorrelation, type: :service do
+  subject { described_class }
+
+  describe "#calculate" do
+    let!(:users) { FactoryGirl.create_list(:user, 4) }
+    let!(:movies) do
+      FactoryGirl.create_list(:movie, 5, :with_actor_director_and_genre)
+    end
+    let(:user_0_ratings) do
+      users[0].ratings << Rating.create(movie_id: movies[1].id, rating_value: 5)
+      users[0].ratings << Rating.create(movie_id: movies[2].id, rating_value: 5)
+      users[0].ratings << Rating.create(movie_id: movies[3].id, rating_value: 3)
+      users[0].ratings << Rating.create(movie_id: movies[4].id, rating_value: 5)
+    end
+    let(:user_1_ratings) do
+      users[1].ratings << Rating.create(movie_id: movies[0].id, rating_value: 5)
+    end
+    let(:user_2_ratings) do
+      users[2].ratings << Rating.create(movie_id: movies[1].id, rating_value: 5)
+      users[2].ratings << Rating.create(movie_id: movies[2].id, rating_value: 4)
+      users[2].ratings << Rating.create(movie_id: movies[3].id, rating_value: 3)
+      users[2].ratings << Rating.create(movie_id: movies[4].id, rating_value: 3)
+    end
+    let(:user_3_ratings) do
+      users[3].ratings << Rating.create(movie_id: movies[1].id, rating_value: 5)
+      users[3].ratings << Rating.create(movie_id: movies[2].id, rating_value: 5)
+      users[3].ratings << Rating.create(movie_id: movies[3].id, rating_value: 3)
+      users[3].ratings << Rating.create(movie_id: movies[4].id, rating_value: 5)
+    end
+    let(:user_3_ratings_alt) do
+      users[3].ratings << Rating.create(movie_id: movies[1].id, rating_value: 1)
+      users[3].ratings << Rating.create(movie_id: movies[2].id, rating_value: 1)
+      users[3].ratings << Rating.create(movie_id: movies[3].id, rating_value: 3)
+      users[3].ratings << Rating.create(movie_id: movies[4].id, rating_value: 1)
+    end
+
+    context "one of the users has no ratings" do
+      before { user_1_ratings }
+
+      it "returns zero" do
+        pearson_corr = subject.new(users[0], users[1]).calculate
+        expect(pearson_corr).to eq(0)
+      end
+    end
+
+    context "users have no movies in common" do
+      before do
+        user_1_ratings
+        user_2_ratings
+      end
+
+      it "returns zero" do
+        pearson_corr = subject.new(users[1], users[2]).calculate
+        expect(pearson_corr).to eq(0)
+      end
+    end
+
+    context "users have similar ratings" do
+      before do
+        user_2_ratings
+        user_3_ratings
+      end
+
+      it "returns a value closer to 1" do
+        pearson_corr = subject.new(users[2], users[3]).calculate
+        expect(pearson_corr).to be_between(-1, 1)
+      end
+    end
+
+    context "users have the same ratings" do
+      before do
+        user_0_ratings
+        user_3_ratings
+      end
+
+      it "returns 1" do
+        pearson_corr = subject.new(users[0], users[3]).calculate
+        expect(pearson_corr).to eq 1
+      end
+    end
+
+    context "users have opposite ratings" do
+      before do
+        user_0_ratings
+        user_3_ratings_alt
+      end
+
+      it "returns -1" do
+        pearson_corr = subject.new(users[0], users[3]).calculate
+        expect(pearson_corr).to eq -1
+      end
+    end
+  end
+end
+
+spec/services/recommendation_system_spec.rb
+---
+require 'spec_helper'
+
+describe RecommendationSystem, type: :service do
+  let(:user) { FactoryGirl.create(:user) }
+  let(:movie_count) { 10 }
+  let(:actor) { FactoryGirl.create(:actor, name: "Jean Claude Van Damme") }
+  let(:director) { FactoryGirl.create(:director, name: "Stanley Kubrick") }
+  let(:genre) { FactoryGirl.create(:genre, name: "Comedy") }
+  let(:movies) { FactoryGirl.create_list(:movie, movie_count) }
+  let(:rating) do
+    FactoryGirl.create(:rating, user_id: user.id, movie_id: movies[0].id,
+                                rating_value: rating_value)
+  end
+  subject { described_class.new(rating) }
+
+  before do
+    movies.each do |movie|
+      movie.genres << genre
+      movie.actors << actor
+      movie.directors << director
+    end
+  end
+
+  context 'Unit Cluster' do
+    let(:cluster) { subject.unit_cluster }
+
+    context "if a rating of 5 is given" do
+      let(:rating_value) { 5 }
+
+      it "returns movie ids for movies with same director, actor and genre" do
+        expect(cluster).to include(movies[1].id, movies[2].id, movies[3].id)
+      end
+
+      it "returns a list of max length 30" do
+        expect(cluster.length).to(
+          be_between(movie_count - 1, RECOMMENDATION_LIMITS[rating_value]))
+      end
+    end
+
+    context "if a rating of 4 is given" do
+      let(:rating_value) { 4 }
+
+      it "returns a list of max length 20" do
+        expect(cluster.length).to(
+          be_between(movie_count - 1, RECOMMENDATION_LIMITS[rating_value]))
+      end
+    end
+
+    context "if a rating of 3 is given" do
+      let(:rating_value) { 3 }
+
+      it "returns a list of max length 10" do
+        expect(cluster.length).to(
+          be_between(movie_count - 1, RECOMMENDATION_LIMITS[rating_value]))
+      end
+    end
+  end
+end
+
+spec/spec_helper.rb
+---
+# This file is copied to spec/ when you run 'rails generate rspec:install'
+ENV["RAILS_ENV"] ||= 'test'
+require File.expand_path("../../config/environment", __FILE__)
+require 'rspec/rails'
+require 'email_spec'
+require 'rspec/autorun'
+require 'capybara'
+require 'pry-nav'
+
+# Requires supporting ruby files with custom matchers and macros, etc,
+# in spec/support/ and its subdirectories.
+Dir[Rails.root.join("spec/support/**/*.rb")].each {|f| require f}
+
+RSpec.configure do |config|
+  config.include(EmailSpec::Helpers)
+  config.include(EmailSpec::Matchers)
+
+  config.fixture_path = "#{::Rails.root}/spec/fixtures"
+
+  config.include Capybara::DSL
+  config.include CapybaraHelpers
+
+  Capybara.javascript_driver = :webkit
+
+  # If you're not using ActiveRecord, or you'd prefer not to run each of your
+  # examples within a transaction, remove the following line or assign false
+  # instead of true.
+  config.use_transactional_fixtures = false
+
+  # If true, the base class of anonymous controllers will be inferred
+  # automatically. This will be the default behavior in future versions of
+  # rspec-rails.
+  config.infer_base_class_for_anonymous_controllers = false
+
+  # Run specs in random order to surface order dependencies. If you find an
+  # order dependency and want to debug it, you can fix the order by providing
+  # the seed, which is printed after each run.
+  #     --seed 1234
+  config.order = "random"
+
+  config.before(:suite) do
+    DatabaseCleaner.strategy = :truncation
+  end
+
+  config.before(:each) do
+    DatabaseCleaner.start
+  end
+
+  config.after(:each) do
+    DatabaseCleaner.clean
+  end
+end
+
+spec/support/capybara_helpers.rb
+---
+module CapybaraHelpers
+
+  def login(user)
+    visit new_user_session_path
+    fill_in "Email", with: user.email
+    fill_in "Password", with: user.password
+    click_button "Sign in"
+  end
+
+end
+
+spec/support/devise.rb
+---
+RSpec.configure do |config|
+  config.include Devise::TestHelpers, type: :controller
+end
+
+app/views/devise/confirmations/new.html.erb
+---
+<h2>Resend confirmation instructions</h2>
+
+<%= form_for(resource, as: resource_name, url: confirmation_path(resource_name), html: { method: :post }) do |f| %>
+  <%= devise_error_messages! %>
+
+  <div class="field">
+    <%= f.label :email %><br />
+    <%= f.email_field :email, autofocus: true, value: (resource.pending_reconfirmation? ? resource.unconfirmed_email : resource.email) %> 
+  </div>
+
+  <div class="actions">
+    <%= f.submit "Resend confirmation instructions" %>
+  </div>
+<% end %>
+
+<%= render "devise/shared/links" %>
+
+app/views/devise/mailer/confirmation_instructions.html.erb
+---
+<p>Welcome <%= @email %>!</p>
+
+<p>You can confirm your account email through the link below:</p>
+
+<p><%= link_to 'Confirm my account', confirmation_url(@resource, confirmation_token: @token) %></p>
+
+app/views/devise/mailer/password_change.html.erb
+---
+<p>Hello <%= @resource.email %>!</p>
+
+<p>We're contacting you to notify you that your password has been changed.</p>
+
+app/views/devise/mailer/reset_password_instructions.html.erb
+---
+<p>Hello <%= @resource.email %>!</p>
+
+<p>Someone has requested a link to change your password. You can do this through the link below.</p>
+
+<p><%= link_to 'Change my password', edit_password_url(@resource, reset_password_token: @token) %></p>
+
+<p>If you didn't request this, please ignore this email.</p>
+<p>Your password won't change until you access the link above and create a new one.</p>
+
+app/views/devise/mailer/unlock_instructions.html.erb
+---
+<p>Hello <%= @resource.email %>!</p>
+
+<p>Your account has been locked due to an excessive number of unsuccessful sign in attempts.</p>
+
+<p>Click the link below to unlock your account:</p>
+
+<p><%= link_to 'Unlock my account', unlock_url(@resource, unlock_token: @token) %></p>
+
+app/views/devise/passwords/edit.html.erb
+---
+<h2>Change your password</h2>
+
+<%= form_for(resource, as: resource_name, url: password_path(resource_name), html: { method: :put }) do |f| %>
+  <%= devise_error_messages! %>
+  <%= f.hidden_field :reset_password_token %>
+
+  <div class="field">
+    <%= f.label :password, "New password" %><br />
+    <% if @minimum_password_length %>
+      <em>(<%= @minimum_password_length %> characters minimum)</em><br />
+    <% end %>
+    <%= f.password_field :password, autofocus: true, autocomplete: "off" %>
+  </div>
+
+  <div class="field">
+    <%= f.label :password_confirmation, "Confirm new password" %><br />
+    <%= f.password_field :password_confirmation, autocomplete: "off" %>
+  </div>
+
+  <div class="actions">
+    <%= f.submit "Change my password" %>
+  </div>
+<% end %>
+
+<%= render "devise/shared/links" %>
+
+app/views/devise/passwords/new.html.erb
+---
+<h2>Forgot your password?</h2>
+
+<%= form_for(resource, as: resource_name, url: password_path(resource_name), html: { method: :post }) do |f| %>
+  <%= devise_error_messages! %>
+
+  <div class="field">
+    <%= f.label :email %><br />
+    <%= f.email_field :email, autofocus: true %>
+  </div>
+
+  <div class="actions">
+    <%= f.submit "Send me reset password instructions" %>
+  </div>
+<% end %>
+
+<%= render "devise/shared/links" %>
+
+app/views/devise/registrations/edit.html.erb
+---
+<h2>Edit <%= resource_name.to_s.humanize %></h2>
+
+<%= form_for(resource, as: resource_name, url: registration_path(resource_name), html: { method: :put }) do |f| %>
+  <%= devise_error_messages! %>
+
+  <div class="field">
+    <%= f.label :email %><br />
+    <%= f.email_field :email, autofocus: true %>
+  </div>
+
+  <% if devise_mapping.confirmable? && resource.pending_reconfirmation? %>
+    <div>Currently waiting confirmation for: <%= resource.unconfirmed_email %></div>
+  <% end %>
+
+  <div class="field">
+    <%= f.label :password %> <i>(leave blank if you don't want to change it)</i><br />
+    <%= f.password_field :password, autocomplete: "off" %>
+  </div>
+
+  <div class="field">
+    <%= f.label :password_confirmation %><br />
+    <%= f.password_field :password_confirmation, autocomplete: "off" %>
+  </div>
+
+  <div class="field">
+    <%= f.label :current_password %> <i>(we need your current password to confirm your changes)</i><br />
+    <%= f.password_field :current_password, autocomplete: "off" %>
+  </div>
+
+  <div class="actions">
+    <%= f.submit "Update" %>
+  </div>
+<% end %>
+
+<%= link_to "Back", :back %>
+
+app/views/devise/registrations/new.html.erb
+---
+<h2>Sign up</h2>
+
+<%= form_for(resource, as: resource_name, url: registration_path(resource_name)) do |f| %>
+  <%= devise_error_messages! %>
+
+  <div class="field">
+    <%= f.label :email %><br />
+    <%= f.email_field :email, autofocus: true %>
+  </div>
+
+  <div class="field">
+    <%= f.label :password %>
+    <% if @minimum_password_length %>
+    <em>(<%= @minimum_password_length %> characters minimum)</em>
+    <% end %><br />
+    <%= f.password_field :password, autocomplete: "off" %>
+  </div>
+
+  <div class="field">
+    <%= f.label :password_confirmation %><br />
+    <%= f.password_field :password_confirmation, autocomplete: "off" %>
+  </div>
+
+  <div class="actions">
+    <%= f.submit "Sign up" %>
+  </div>
+<% end %>
+
+<%= render "devise/shared/links" %>
+
+app/views/devise/sessions/new.html.erb
+---
+<div class="front-form">
+  <%= form_for(resource, as: resource_name, url: session_path(resource_name)) do |f| %>
+    <div class="email">
+      <%= f.email_field :email, autofocus: true, placeholder: "juan@perez.com" %>
+    </div>
+
+    <div class="password">
+      <%= f.password_field :password, autocomplete: "off", placeholder: "Password" %>
+    </div>
+
+    <div class="actions">
+      <%= f.submit "Log in", class: "pure-button pure-button-primary" %>
+    </div>
+  <% end %>
+</div>
+
+app/views/devise/shared/_links.html.erb
+---
+<%- if controller_name != 'sessions' %>
+  <%= link_to "Log in", new_session_path(resource_name) %><br />
+<% end -%>
+
+<%- if devise_mapping.confirmable? && controller_name != 'confirmations' %>
+  <%= link_to "Didn't receive confirmation instructions?", new_confirmation_path(resource_name) %><br />
+<% end -%>
+
+<%- if devise_mapping.lockable? && resource_class.unlock_strategy_enabled?(:email) && controller_name != 'unlocks' %>
+  <%= link_to "Didn't receive unlock instructions?", new_unlock_path(resource_name) %><br />
+<% end -%>
+
+app/views/devise/unlocks/new.html.erb
+---
+<h2>Resend unlock instructions</h2>
+
+<%= form_for(resource, as: resource_name, url: unlock_path(resource_name), html: { method: :post }) do |f| %>
+  <%= devise_error_messages! %>
+
+  <div class="field">
+    <%= f.label :email %><br />
+    <%= f.email_field :email, autofocus: true %>
+  </div>
+
+  <div class="actions">
+    <%= f.submit "Resend unlock instructions" %>
+  </div>
+<% end %>
+
+<%= render "devise/shared/links" %>
+
+app/views/home/index.html.erb
+---
+<!-- <div class='login-background'> -->
+	<div class="front-form">
+
+	<%= form_for(resource, as: resource_name, url: registration_path(resource_name)) do |f| %>
+		<div class="errors">
+	  	<%= devise_error_messages! %>
+		</div>
+
+	  <div class="email">
+	  	<%= f.email_field :email, placeholder: "juan@perez.com" %>
+		</div>
+
+	  <div class="password">
+	  	<%= f.password_field :password, placeholder: "Password" %>
+		</div>
+
+	  <div class="password-confirm">
+	  	<%= f.password_field :password_confirmation, placeholder: "Password Confirmation" %>
+		</div>
+
+	  <div class="actions">
+			<%= f.submit "Sign up", class: "pure-button pure-button-primary" %>
+		</div>
+	<% end %>
+
+	</div>
+<!-- </div> -->
+
+app/views/layouts/application.html.erb
+---
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Movie Recommendation System</title>
+    <link href='https://fonts.googleapis.com/css?family=Oxygen:400,300,700' rel='stylesheet' type='text/css'>
+    <%= stylesheet_link_tag "application", media: "all" %>
+    <%= javascript_include_tag "application" %>
+    <%= csrf_meta_tags %>
+    <%= yield(:head) %>
+  </head>
+
+  <body class="<%= controller_name %> <%= action_name %>">
+    <div class="row-fluid">
+      <div class="navbar navbar-fixed-top">
+        <nav class="navbar-inner">
+          <div class="container">
+           <%= render "shared/navigation" %>
+          </div>
+        </nav>
+      </div>
+
+      <% if user_signed_in? %>
+      	<div id="search">
+      	  <%= form_tag("/search", method: "get", class: 'pure-form pure-g') do %>
+      	    <%= text_field_tag :query, nil, class: 'pure-input-1-2', placeholder: 'Search for keywords' %>
+      	    <button class="pure-button pure-button-primary"><i class="icon-search"></i> Search</button>
+      	  <% end %>
+      	</div>
+      <% end %>
+
+      <div id="main" role="main">
+        <div class="container">
+          <div class="span12">
+            <%= render "shared/messages" %>
+            <%= yield %>
+          </div>
+         </div> <!--! end of container -->
+      </div> <!--! end of #main -->
+    </div>
+  </body>
+</html>
+
+app/views/ratings/index.html.erb
+---
+<div class='movie-list'>
+  <% @movies.each do |movie| %>
+    <% rated_movie =  @ratings.include? movie.id  %>
+    <% current_rating = @rating_values[movie.id].to_i %>
+    <% if rated_movie %>
+      <% rating = Rating.where(movie_id: movie.id, user_id: current_user.id).first %>
+      <%= render 'shared/movie', movie: movie, rated_movie: rated_movie, current_rating: current_rating, rating: rating %>
+    <% else %>
+      <%= render 'shared/movie_no_rating', movie: movie, rated_movie: rated_movie, current_rating: current_rating%>
+    <% end %>
+  <% end %>
+</div>
+
+app/views/ratings/search.html.erb
+---
+<div class='movie-list'>
+  <% if @actor_movies.nil? && @director_movies.nil? && @movies.nil? %>
+    <p>Nothing matched your search.</p>
+  <% elsif @actor_movies %>
+    <% @actor_movies.each do |movie| %>
+      <% rated_movie =  @ratings_movie_ids.include? movie.id %>
+      <% current_rating = @rating_values[movie.id].to_i %>
+      <% if rated_movie %>
+        <% rating = Rating.where(movie_id: movie.id, user_id: current_user.id).first %>
+        <%= render 'shared/movie', movie: movie, rated_movie: rated_movie, current_rating: current_rating, rating: rating %>
+      <% else %>
+        <%= render 'shared/movie_no_rating', movie: movie, rated_movie: rated_movie, current_rating: current_rating %>
+      <% end %>
+    <% end %>
+  <% elsif @director_movies %>
+    <% @director_movies.each do |movie| %>
+      <% rated_movie =  @ratings_movie_ids.include? movie.id %>
+      <% current_rating = @rating_values[movie.id].to_i %>
+      <% if rated_movie %>
+        <% rating = Rating.where(movie_id: movie.id, user_id: current_user.id).first %>
+        <%= render 'shared/movie', movie: movie, rated_movie: rated_movie, current_rating: current_rating, rating: rating %>
+      <% else %>
+        <%= render 'shared/movie_no_rating', movie: movie, rated_movie: rated_movie, current_rating: current_rating %>
+      <% end %>
+    <% end %>
+  <% else %>
+    <% @movies.each do |movie| %>
+      <% rated_movie =  @ratings_movie_ids.include? movie.id %>
+      <% current_rating = @rating_values[movie.id].to_i %>
+      <% if rated_movie %>
+        <% rating = Rating.where(movie_id: movie.id, user_id: current_user.id).first %>
+        <%= render 'shared/movie', movie: movie, rated_movie: rated_movie, current_rating: current_rating, rating: rating %>
+      <% else %>
+        <%= render 'shared/movie_no_rating', movie: movie, rated_movie: rated_movie, current_rating: current_rating %>
+      <% end %>
+    <% end %>
+  <% end %>
+</div>
+
+app/views/recommendations/index.html.erb
+---
+<div class='movie-list'>
+  <% if @recommendations.empty? %>
+    <h2>
+      <%= link_to "Please rate more movies to receive recommendations!", ratings_path %>
+    </h2>
+  <% else %>
+    <% @recommendations.each do |recommendation| %>
+      <% rated_movie = @ratings.include?(recommendation.movie_id) %>
+      <% current_rating = @rating_values[recommendation.movie_id].to_i %>
+      <%= render 'shared/movie_no_rating', movie: recommendation.movie,
+                                           rated_movie: rated_movie,
+                                           current_rating: current_rating %>
+    <% end %>
+  <% end %>
+
+</div>
+
+app/views/shared/_messages.html.erb
+---
+<% flash.each do |name, msg| %>
+  <% if msg.is_a?(String) %>
+    <div class="alert alert-<%= name == 'notice' ? 'success' : 'error' %>">
+      <a class="close" data-dismiss="alert">&#215;</a>
+      <%= content_tag :div, msg, id: "flash_#{name}" %>
+    </div>
+  <% end %>
+<% end %>
+
+app/views/shared/_movie.html.erb
+---
+<div class="ratings-movie">
+  <div class='poster'>
+    <%= link_to image_tag(movie.poster_url, height: '300'), movie.trailer_url %>
+  </div>
+
+  <div class='title'>
+    <%= link_to movie.title, movie.trailer_url %>
+  </div>
+
+  <span class='date'>
+     (<%= movie.release_date.try(:year) || "N/A" %>)
+  </span>
+
+  <span class='mpaa-rating'>
+    <% if movie.mpaa_rating.try(:empty?) %>
+      Not Rated
+    <% else %>
+      <%= movie.mpaa_rating %>
+    <% end %>
+  </span>
+
+  <div class="rating" data-current_rating="<%= current_rating if current_rating %>">
+    <% (1..5).each do |star| %>
+      <%= link_to '☆', rating_path(rating, rating_value: star,
+                                            movie_id: movie.id),
+                        method: :put, remote: true, class: "movie-rating-value",
+                        "data-movie_id" => movie.id,
+                        "data-rating_value" => star,
+                        "data-rating_id" => rating.id %>
+    <% end %>
+  </div>
+
+
+</div>
+
+app/views/shared/_movie_no_rating.html.erb
+---
+<div class="ratings-movie">
+  <div class='poster'>
+    <%= link_to image_tag(movie.poster_url, height: '300'), movie.trailer_url %>
+  </div>
+
+  <div class='title'>
+    <%= link_to movie.title, movie.trailer_url %>
+  </div>
+
+  <span class='date'>
+     (<%= movie.release_date.try(:year) || "N/A" %>)
+  </span>
+
+  <span class='mpaa-rating'>
+    <% if movie.mpaa_rating.try(:empty?) %>
+      Not Rated
+    <% else %>
+      <%= movie.mpaa_rating %>
+    <% end %>
+  </span>
+
+  <div class="rating" data-current_rating="<%= current_rating if current_rating %>">
+    <% (1..5).each do |star| %>
+      <%= link_to '☆', ratings_path(rating_value: star, movie_id: movie.id),
+                        method: :post, remote: true,
+                        class: "movie-rating-value",
+                        "data-movie_id" => movie.id,
+                        "data-rating_value" => star %>
+    <% end %>
+  </div>
+
+</div>
+
+app/views/shared/_navigation.html.erb
+---
+<ul class="nav">
+  <% if user_signed_in? %>
+   <li>
+     <%= link_to recommendations_path, id: 'recommendation' do %>
+      <i class="icon-film"></i> Recommendations
+     <% end %>
+   </li>
+   <li>
+    <%= link_to ratings_path, id: 'rate' do %>
+      <i class="icon-thumbs-up-alt"></i> Rate Movies
+    <% end %>
+  </li>
+  <li>
+    <%= link_to user_ratings_path do %>
+      <i class="icon-archive"></i> My Ratings
+    <% end %>
+  </li>
+  <li>
+    <%= link_to 'Logout', destroy_user_session_path, method: :delete %>
+  </li>
+  <% else %>
+    <li>
+      <%= link_to 'Sign up', root_path %>
+    </li>
+    <li>
+      <%= link_to 'Login', new_user_session_path %>
+    </li>
+  <% end %>
+</ul>
+
+app/views/shared/_upcoming_movies.html.erb
+---
+<% @prepopulated_upcoming_movies.each do |upcoming| %>
+  <div class="movie">
+    <div class='poster'>
+      <%= image_tag(upcoming['posters']['detailed'], height: "250") %>
+    </div>
+
+    <div class="title">
+      <%= upcoming['title']%>
+    </div>
+
+    <div class="release_date">
+      <%= upcoming['release_dates']['theater'] %>
+    </div>
+
+    <div class="tomatoes">
+      <% if upcoming['ratings']['critics_rating'] == 'Fresh' %>
+        <%= image_tag '/assets/tomatoe-icons.png', height:15 %>
+      <% elsif upcoming['ratings']['critics_rating'] == 'Rotten'%>
+        <%= image_tag '/assets/rotten.gif', height:15 %>
+      <% else %>
+      <% end %>
+      <span class="critics_rating">
+        <%= upcoming['ratings']['critics_rating'] %>
+      </span>
+
+      <% if upcoming['ratings']['critics_score'] < 65 %>
+        <i class="icon-thumbs-down-alt"></i>
+      <% elsif upcoming['ratings']['critics_score'] >= 65 && upcoming['ratings']['critics_score'] <= 75 %>
+        <i class="icon-meh"></i>
+      <% else %>
+        <i class="icon-thumbs-up-alt"></i>
+      <% end %>
+      <span class="critics_score">
+        <%= upcoming['ratings']['critics_score'] %>
+      </span>%
+      <span class="audience_score">
+        <i class="icon-male"></i>
+        <%= upcoming['ratings']['audience_score'] %>
+      </span>%
+    </div>
+  </div>
+<% end %>
+
+app/views/users/ratings.html.erb
+---
+<div class='movie-list'>
+  <% @ratings.each do |rating| %>
+    <% rated_movie =  true %>
+    <% current_rating = @rating_values[rating.movie_id].to_i %>
+    <%= render 'shared/movie', movie: rating.movie, rated_movie: rated_movie, current_rating: current_rating, rating: rating %>
+  <% end %>
+</div>
+
+app/assets/javascripts/application.js
+---
+// This is a manifest file that'll be compiled into application.js, which will include all the files
+// listed below.
+//
+// Any JavaScript/Coffee file within this directory, lib/assets/javascripts, vendor/assets/javascripts,
+// or vendor/assets/javascripts of plugins, if any, can be referenced here using a relative path.
+//
+// It's not advisable to add code directly here, but if you do, it'll appear at the bottom of the
+// the compiled file.
+//
+// WARNING: THE FIRST BLANK LINE MARKS THE END OF WHAT'S TO BE PROCESSED, ANY BLANK LINE SHOULD
+// GO AFTER THE REQUIRES BELOW.
+//
+//= require jquery
+//= require jquery_ujs
+//= require bootstrap
+//= require_tree .
+
+$(function() {
+
+  var filledInStar = '\u2605';
+  var hollowStar = '☆';
+
+  var hollowStars = function(self) {
+    $(self).text(hollowStar);
+    $(self).siblings().text(hollowStar);
+  };
+
+  var fillStars = function(self) {
+    $(self).text(filledInStar);
+    $(self).prevAll().text(filledInStar);
+  };
+
+  var fillStarsUptoRating = function(self) {
+    var rating = $(self).parent().data('current_rating');
+
+    $(self).parent().find('.movie-rating-value').each(function(index) {
+      if (index > (rating-1)) {
+        return false;
+      }
+      $(this).text(filledInStar);
+    });
+  };
+
+  var updateStarsForAll = function($movies) {
+    $(document).find('.movie-rating-value').each(function(e) {
+      fillStarsUptoRating(this);
+    });
+  };
+
+  $(".movie-rating-value").on("ajax:success", function(e, data, status, xhr) {
+    var self = this;
+    var $movieRating = $(this).closest('div.ratings-movie');
+    $movieRating.find('.rating').data('current_rating', data.rating_value);
+
+    $movieRating.find('.rating a').each(function(index) {
+      var rating_id = data.id;
+      var movie_id = $(this).data('movie_id');
+      var rating_value = $(this).data('rating_value');
+      var new_href = '/ratings/' + rating_id + '?movie_id=' + movie_id + '&rating_value=' + rating_value;
+      $(this).attr('href', new_href);
+    });
+
+    $movieRating.find('.rating').find('a').attr('data-method', 'put');
+    $(this).data('method', 'put');
+
+    hollowStars(this);
+    fillStarsUptoRating(this);
+
+  }).on("ajax:error", function(e, xhr, status, error) {
+    var $movieRating = $(this).closest('div.ratings-movie');
+    var title = $movieRating.find('div.title');
+    title.append('<p>Already rated that value.</p>');
+    title.find('p').fadeOut(500);
+  }).mouseover(function (e) {
+    hollowStars(this);
+    fillStars(this);
+  }).mouseout(function (e) {
+    hollowStars(this);
+    fillStarsUptoRating(this);
+  });
+
+  updateStarsForAll();
+
+});
+
+vendor/assets/stylesheets/animations.css
+---
+/*
+==============================================
+CSS3 ANIMATION CHEAT SHEET
+==============================================
+
+Made by Justin Aguilar
+
+www.justinaguilar.com/animations/
+
+Questions, comments, concerns, love letters:
+justin@justinaguilar.com
+==============================================
+*/
+
+/*
+==============================================
+slideDown
+==============================================
+*/
+
+
+.slideDown{
+	animation-name: slideDown;
+	-webkit-animation-name: slideDown;	
+
+	animation-duration: 1s;	
+	-webkit-animation-duration: 1s;
+
+	animation-timing-function: ease;	
+	-webkit-animation-timing-function: ease;	
+
+	visibility: visible !important;						
+}
+
+@keyframes slideDown {
+	0% {
+		transform: translateY(-100%);
+	}
+	50%{
+		transform: translateY(8%);
+	}
+	65%{
+		transform: translateY(-4%);
+	}
+	80%{
+		transform: translateY(4%);
+	}
+	95%{
+		transform: translateY(-2%);
+	}			
+	100% {
+		transform: translateY(0%);
+	}		
+}
+
+@-webkit-keyframes slideDown {
+	0% {
+		-webkit-transform: translateY(-100%);
+	}
+	50%{
+		-webkit-transform: translateY(8%);
+	}
+	65%{
+		-webkit-transform: translateY(-4%);
+	}
+	80%{
+		-webkit-transform: translateY(4%);
+	}
+	95%{
+		-webkit-transform: translateY(-2%);
+	}			
+	100% {
+		-webkit-transform: translateY(0%);
+	}	
+}
+
+/*
+==============================================
+slideUp
+==============================================
+*/
+
+
+.slideUp{
+	animation-name: slideUp;
+	-webkit-animation-name: slideUp;	
+
+	animation-duration: 1s;	
+	-webkit-animation-duration: 1s;
+
+	animation-timing-function: ease;	
+	-webkit-animation-timing-function: ease;
+
+	visibility: visible !important;			
+}
+
+@keyframes slideUp {
+	0% {
+		transform: translateY(100%);
+	}
+	50%{
+		transform: translateY(-8%);
+	}
+	65%{
+		transform: translateY(4%);
+	}
+	80%{
+		transform: translateY(-4%);
+	}
+	95%{
+		transform: translateY(2%);
+	}			
+	100% {
+		transform: translateY(0%);
+	}	
+}
+
+@-webkit-keyframes slideUp {
+	0% {
+		-webkit-transform: translateY(100%);
+	}
+	50%{
+		-webkit-transform: translateY(-8%);
+	}
+	65%{
+		-webkit-transform: translateY(4%);
+	}
+	80%{
+		-webkit-transform: translateY(-4%);
+	}
+	95%{
+		-webkit-transform: translateY(2%);
+	}			
+	100% {
+		-webkit-transform: translateY(0%);
+	}	
+}
+
+/*
+==============================================
+slideLeft
+==============================================
+*/
+
+
+.slideLeft{
+	animation-name: slideLeft;
+	-webkit-animation-name: slideLeft;	
+
+	animation-duration: 1s;	
+	-webkit-animation-duration: 1s;
+
+	animation-timing-function: ease-in-out;	
+	-webkit-animation-timing-function: ease-in-out;		
+
+	visibility: visible !important;	
+}
+
+@keyframes slideLeft {
+	0% {
+		transform: translateX(150%);
+	}
+	50%{
+		ransform: translateX(-8%);
+	}
+	65%{
+		transform: translateX(4%);
+	}
+	80%{
+		transform: translateX(-4%);
+	}
+	95%{
+		transform: translateX(2%);
+	}			
+	100% {
+		transform: translateX(0%);
+	}
+}
+
+@-webkit-keyframes slideLeft {
+	0% {
+		-webkit-transform: translateX(150%);
+	}
+	50%{
+		-webkit-transform: translateX(-8%);
+	}
+	65%{
+		-webkit-transform: translateX(4%);
+	}
+	80%{
+		-webkit-transform: translateX(-4%);
+	}
+	95%{
+		-webkit-transform: translateX(2%);
+	}			
+	100% {
+		-webkit-transform: translateX(0%);
+	}
+}
+
+/*
+==============================================
+slideRight
+==============================================
+*/
+
+
+.slideRight{
+	animation-name: slideRight;
+	-webkit-animation-name: slideRight;	
+
+	animation-duration: 1s;	
+	-webkit-animation-duration: 1s;
+
+	animation-timing-function: ease-in-out;	
+	-webkit-animation-timing-function: ease-in-out;		
+
+	visibility: visible !important;	
+}
+
+@keyframes slideRight {
+	0% {
+		transform: translateX(-150%);
+	}
+	50%{
+		transform: translateX(8%);
+	}
+	65%{
+		transform: translateX(-4%);
+	}
+	80%{
+		transform: translateX(4%);
+	}
+	95%{
+		transform: translateX(-2%);
+	}			
+	100% {
+		transform: translateX(0%);
+	}	
+}
+
+@-webkit-keyframes slideRight {
+	0% {
+		-webkit-transform: translateX(-150%);
+	}
+	50%{
+		-webkit-transform: translateX(8%);
+	}
+	65%{
+		-webkit-transform: translateX(-4%);
+	}
+	80%{
+		-webkit-transform: translateX(4%);
+	}
+	95%{
+		-webkit-transform: translateX(-2%);
+	}			
+	100% {
+		-webkit-transform: translateX(0%);
+	}
+}
+
+/*
+==============================================
+slideExpandUp
+==============================================
+*/
+
+
+.slideExpandUp{
+	animation-name: slideExpandUp;
+	-webkit-animation-name: slideExpandUp;	
+
+	animation-duration: 1.6s;	
+	-webkit-animation-duration: 1.6s;
+
+	animation-timing-function: ease-out;	
+	-webkit-animation-timing-function: ease -out;
+
+	visibility: visible !important;	
+}
+
+@keyframes slideExpandUp {
+	0% {
+		transform: translateY(100%) scaleX(0.5);
+	}
+	30%{
+		transform: translateY(-8%) scaleX(0.5);
+	}	
+	40%{
+		transform: translateY(2%) scaleX(0.5);
+	}
+	50%{
+		transform: translateY(0%) scaleX(1.1);
+	}
+	60%{
+		transform: translateY(0%) scaleX(0.9);		
+	}
+	70% {
+		transform: translateY(0%) scaleX(1.05);
+	}			
+	80%{
+		transform: translateY(0%) scaleX(0.95);		
+	}
+	90% {
+		transform: translateY(0%) scaleX(1.02);
+	}	
+	100%{
+		transform: translateY(0%) scaleX(1);		
+	}
+}
+
+@-webkit-keyframes slideExpandUp {
+	0% {
+		-webkit-transform: translateY(100%) scaleX(0.5);
+	}
+	30%{
+		-webkit-transform: translateY(-8%) scaleX(0.5);
+	}	
+	40%{
+		-webkit-transform: translateY(2%) scaleX(0.5);
+	}
+	50%{
+		-webkit-transform: translateY(0%) scaleX(1.1);
+	}
+	60%{
+		-webkit-transform: translateY(0%) scaleX(0.9);		
+	}
+	70% {
+		-webkit-transform: translateY(0%) scaleX(1.05);
+	}			
+	80%{
+		-webkit-transform: translateY(0%) scaleX(0.95);		
+	}
+	90% {
+		-webkit-transform: translateY(0%) scaleX(1.02);
+	}	
+	100%{
+		-webkit-transform: translateY(0%) scaleX(1);		
+	}
+}
+
+/*
+==============================================
+expandUp
+==============================================
+*/
+
+
+.expandUp{
+	animation-name: expandUp;
+	-webkit-animation-name: expandUp;	
+
+	animation-duration: 0.7s;	
+	-webkit-animation-duration: 0.7s;
+
+	animation-timing-function: ease;	
+	-webkit-animation-timing-function: ease;		
+
+	visibility: visible !important;	
+}
+
+@keyframes expandUp {
+	0% {
+		transform: translateY(100%) scale(0.6) scaleY(0.5);
+	}
+	60%{
+		transform: translateY(-7%) scaleY(1.12);
+	}
+	75%{
+		transform: translateY(3%);
+	}	
+	100% {
+		transform: translateY(0%) scale(1) scaleY(1);
+	}	
+}
+
+@-webkit-keyframes expandUp {
+	0% {
+		-webkit-transform: translateY(100%) scale(0.6) scaleY(0.5);
+	}
+	60%{
+		-webkit-transform: translateY(-7%) scaleY(1.12);
+	}
+	75%{
+		-webkit-transform: translateY(3%);
+	}	
+	100% {
+		-webkit-transform: translateY(0%) scale(1) scaleY(1);
+	}	
+}
+
+/*
+==============================================
+fadeIn
+==============================================
+*/
+
+.fadeIn{
+	animation-name: fadeIn;
+	-webkit-animation-name: fadeIn;	
+
+	animation-duration: 0.5s;	
+	-webkit-animation-duration: 0.5s;
+
+	animation-timing-function: ease-in-out;	
+	-webkit-animation-timing-function: ease-in-out;		
+
+	visibility: visible !important;	
+}
+
+@keyframes fadeIn {
+	0% {
+		transform: scale(0);
+		opacity: 0.0;		
+	}
+	60% {
+		transform: scale(1.1);	
+	}
+	80% {
+		transform: scale(0.9);
+		opacity: 1;	
+	}	
+	100% {
+		transform: scale(1);
+		opacity: 1;	
+	}		
+}
+
+@-webkit-keyframes fadeIn {
+	0% {
+		-webkit-transform: scale(0);
+		opacity: 0.0;		
+	}
+	60% {
+		-webkit-transform: scale(1.1);
+	}
+	80% {
+		-webkit-transform: scale(0.9);
+		opacity: 1;	
+	}	
+	100% {
+		-webkit-transform: scale(1);
+		opacity: 1;	
+	}		
+}
+
+/*
+==============================================
+expandOpen
+==============================================
+*/
+
+
+.expandOpen{
+	animation-name: expandOpen;
+	-webkit-animation-name: expandOpen;	
+
+	animation-duration: 1.2s;	
+	-webkit-animation-duration: 1.2s;
+
+	animation-timing-function: ease-out;	
+	-webkit-animation-timing-function: ease-out;	
+
+	visibility: visible !important;	
+}
+
+@keyframes expandOpen {
+	0% {
+		transform: scale(1.8);		
+	}
+	50% {
+		transform: scale(0.95);
+	}	
+	80% {
+		transform: scale(1.05);
+	}
+	90% {
+		transform: scale(0.98);
+	}	
+	100% {
+		transform: scale(1);
+	}			
+}
+
+@-webkit-keyframes expandOpen {
+	0% {
+		-webkit-transform: scale(1.8);		
+	}
+	50% {
+		-webkit-transform: scale(0.95);
+	}	
+	80% {
+		-webkit-transform: scale(1.05);
+	}
+	90% {
+		-webkit-transform: scale(0.98);
+	}	
+	100% {
+		-webkit-transform: scale(1);
+	}					
+}
+
+/*
+==============================================
+bigEntrance
+==============================================
+*/
+
+
+.bigEntrance{
+	animation-name: bigEntrance;
+	-webkit-animation-name: bigEntrance;	
+
+	animation-duration: 1.6s;	
+	-webkit-animation-duration: 1.6s;
+
+	animation-timing-function: ease-out;	
+	-webkit-animation-timing-function: ease-out;	
+
+	visibility: visible !important;			
+}
+
+@keyframes bigEntrance {
+	0% {
+		transform: scale(0.3) rotate(6deg) translateX(-30%) translateY(30%);
+		opacity: 0.2;
+	}
+	30% {
+		transform: scale(1.03) rotate(-2deg) translateX(2%) translateY(-2%);		
+		opacity: 1;
+	}
+	45% {
+		transform: scale(0.98) rotate(1deg) translateX(0%) translateY(0%);
+		opacity: 1;
+	}
+	60% {
+		transform: scale(1.01) rotate(-1deg) translateX(0%) translateY(0%);		
+		opacity: 1;
+	}	
+	75% {
+		transform: scale(0.99) rotate(1deg) translateX(0%) translateY(0%);
+		opacity: 1;
+	}
+	90% {
+		transform: scale(1.01) rotate(0deg) translateX(0%) translateY(0%);		
+		opacity: 1;
+	}	
+	100% {
+		transform: scale(1) rotate(0deg) translateX(0%) translateY(0%);
+		opacity: 1;
+	}		
+}
+
+@-webkit-keyframes bigEntrance {
+	0% {
+		-webkit-transform: scale(0.3) rotate(6deg) translateX(-30%) translateY(30%);
+		opacity: 0.2;
+	}
+	30% {
+		-webkit-transform: scale(1.03) rotate(-2deg) translateX(2%) translateY(-2%);		
+		opacity: 1;
+	}
+	45% {
+		-webkit-transform: scale(0.98) rotate(1deg) translateX(0%) translateY(0%);
+		opacity: 1;
+	}
+	60% {
+		-webkit-transform: scale(1.01) rotate(-1deg) translateX(0%) translateY(0%);		
+		opacity: 1;
+	}	
+	75% {
+		-webkit-transform: scale(0.99) rotate(1deg) translateX(0%) translateY(0%);
+		opacity: 1;
+	}
+	90% {
+		-webkit-transform: scale(1.01) rotate(0deg) translateX(0%) translateY(0%);		
+		opacity: 1;
+	}	
+	100% {
+		-webkit-transform: scale(1) rotate(0deg) translateX(0%) translateY(0%);
+		opacity: 1;
+	}				
+}
+
+/*
+==============================================
+hatch
+==============================================
+*/
+
+.hatch{
+	animation-name: hatch;
+	-webkit-animation-name: hatch;	
+
+	animation-duration: 2s;	
+	-webkit-animation-duration: 2s;
+
+	animation-timing-function: ease-in-out;	
+	-webkit-animation-timing-function: ease-in-out;
+
+	transform-origin: 50% 100%;
+	-ms-transform-origin: 50% 100%;
+	-webkit-transform-origin: 50% 100%; 
+
+	visibility: visible !important;		
+}
+
+@keyframes hatch {
+	0% {
+		transform: rotate(0deg) scaleY(0.6);
+	}
+	20% {
+		transform: rotate(-2deg) scaleY(1.05);
+	}
+	35% {
+		transform: rotate(2deg) scaleY(1);
+	}
+	50% {
+		transform: rotate(-2deg);
+	}	
+	65% {
+		transform: rotate(1deg);
+	}	
+	80% {
+		transform: rotate(-1deg);
+	}		
+	100% {
+		transform: rotate(0deg);
+	}									
+}
+
+@-webkit-keyframes hatch {
+	0% {
+		-webkit-transform: rotate(0deg) scaleY(0.6);
+	}
+	20% {
+		-webkit-transform: rotate(-2deg) scaleY(1.05);
+	}
+	35% {
+		-webkit-transform: rotate(2deg) scaleY(1);
+	}
+	50% {
+		-webkit-transform: rotate(-2deg);
+	}	
+	65% {
+		-webkit-transform: rotate(1deg);
+	}	
+	80% {
+		-webkit-transform: rotate(-1deg);
+	}		
+	100% {
+		-webkit-transform: rotate(0deg);
+	}		
+}
+
+
+/*
+==============================================
+bounce
+==============================================
+*/
+
+
+.bounce{
+	animation-name: bounce;
+	-webkit-animation-name: bounce;	
+
+	animation-duration: 1.6s;	
+	-webkit-animation-duration: 1.6s;
+
+	animation-timing-function: ease;	
+	-webkit-animation-timing-function: ease;	
+	
+	transform-origin: 50% 100%;
+	-ms-transform-origin: 50% 100%;
+	-webkit-transform-origin: 50% 100%; 	
+}
+
+@keyframes bounce {
+	0% {
+		transform: translateY(0%) scaleY(0.6);
+	}
+	60%{
+		transform: translateY(-100%) scaleY(1.1);
+	}
+	70%{
+		transform: translateY(0%) scaleY(0.95) scaleX(1.05);
+	}
+	80%{
+		transform: translateY(0%) scaleY(1.05) scaleX(1);
+	}	
+	90%{
+		transform: translateY(0%) scaleY(0.95) scaleX(1);
+	}				
+	100%{
+		transform: translateY(0%) scaleY(1) scaleX(1);
+	}	
+}
+
+@-webkit-keyframes bounce {
+	0% {
+		-webkit-transform: translateY(0%) scaleY(0.6);
+	}
+	60%{
+		-webkit-transform: translateY(-100%) scaleY(1.1);
+	}
+	70%{
+		-webkit-transform: translateY(0%) scaleY(0.95) scaleX(1.05);
+	}
+	80%{
+		-webkit-transform: translateY(0%) scaleY(1.05) scaleX(1);
+	}	
+	90%{
+		-webkit-transform: translateY(0%) scaleY(0.95) scaleX(1);
+	}				
+	100%{
+		-webkit-transform: translateY(0%) scaleY(1) scaleX(1);
+	}		
+}
+
+
+/*
+==============================================
+pulse
+==============================================
+*/
+
+.pulse{
+	animation-name: pulse;
+	-webkit-animation-name: pulse;	
+
+	animation-duration: 1.5s;	
+	-webkit-animation-duration: 1.5s;
+
+	animation-iteration-count: infinite;
+	-webkit-animation-iteration-count: infinite;
+}
+
+@keyframes pulse {
+	0% {
+		transform: scale(0.9);
+		opacity: 0.7;		
+	}
+	50% {
+		ransform: scale(1);
+		opacity: 1;	
+	}	
+	100% {
+		transform: scale(0.9);
+		opacity: 0.7;	
+	}			
+}
+
+@-webkit-keyframes pulse {
+	0% {
+		-webkit-transform: scale(0.95);
+		opacity: 0.7;		
+	}
+	50% {
+		-webkit-transform: scale(1);
+		opacity: 1;	
+	}	
+	100% {
+		-webkit-transform: scale(0.95);
+		opacity: 0.7;	
+	}			
+}
+
+/*
+==============================================
+floating
+==============================================
+*/
+
+.floating{
+	animation-name: floating;
+	-webkit-animation-name: floating;
+
+	animation-duration: 1.5s;	
+	-webkit-animation-duration: 1.5s;
+
+	animation-iteration-count: infinite;
+	-webkit-animation-iteration-count: infinite;
+}
+
+@keyframes floating {
+	0% {
+		transform: translateY(0%);	
+	}
+	50% {
+		transform: translateY(20%);	
+	}	
+	100% {
+		transform: translateY(0%);
+	}			
+}
+
+@-webkit-keyframes floating {
+	0% {
+		-webkit-transform: translateY(0%);	
+	}
+	50% {
+		-webkit-transform: translateY(20%);	
+	}	
+	100% {
+		-webkit-transform: translateY(0%);
+	}			
+}
+
+/*
+==============================================
+tossing
+==============================================
+*/
+
+.tossing{
+	animation-name: tossing;
+	-webkit-animation-name: tossing;	
+
+	animation-duration: 5s;	
+	-webkit-animation-duration: 5s;
+
+}
+
+@keyframes tossing {
+	0% {
+		transform: rotate(-4deg);	
+	}
+	50% {
+		transform: rotate(4deg);
+	}
+	100% {
+		transform: rotate(-4deg);	
+	}						
+}
+
+@-webkit-keyframes tossing {
+	0% {
+		-webkit-transform: rotate(-4deg);	
+	}
+	50% {
+		-webkit-transform: rotate(4deg);
+	}
+	100% {
+		-webkit-transform: rotate(-4deg);	
+	}				
+}
+
+/*
+==============================================
+pullUp
+==============================================
+*/
+
+.pullUp{
+	animation-name: pullUp;
+	-webkit-animation-name: pullUp;	
+
+	animation-duration: 1.1s;	
+	-webkit-animation-duration: 1.1s;
+
+	animation-timing-function: ease-out;	
+	-webkit-animation-timing-function: ease-out;	
+
+	transform-origin: 50% 100%;
+	-ms-transform-origin: 50% 100%;
+	-webkit-transform-origin: 50% 100%; 		
+}
+
+@keyframes pullUp {
+	0% {
+		transform: scaleY(0.1);
+	}
+	40% {
+		transform: scaleY(1.02);
+	}
+	60% {
+		transform: scaleY(0.98);
+	}
+	80% {
+		transform: scaleY(1.01);
+	}
+	100% {
+		transform: scaleY(0.98);
+	}				
+	80% {
+		transform: scaleY(1.01);
+	}
+	100% {
+		transform: scaleY(1);
+	}							
+}
+
+@-webkit-keyframes pullUp {
+	0% {
+		-webkit-transform: scaleY(0.1);
+	}
+	40% {
+		-webkit-transform: scaleY(1.02);
+	}
+	60% {
+		-webkit-transform: scaleY(0.98);
+	}
+	80% {
+		-webkit-transform: scaleY(1.01);
+	}
+	100% {
+		-webkit-transform: scaleY(0.98);
+	}				
+	80% {
+		-webkit-transform: scaleY(1.01);
+	}
+	100% {
+		-webkit-transform: scaleY(1);
+	}		
+}
+
+/*
+==============================================
+pullDown
+==============================================
+*/
+
+.pullDown{
+	animation-name: pullDown;
+	-webkit-animation-name: pullDown;	
+
+	animation-duration: 1.1s;	
+	-webkit-animation-duration: 1.1s;
+
+	animation-timing-function: ease-out;	
+	-webkit-animation-timing-function: ease-out;	
+
+	transform-origin: 50% 0%;
+	-ms-transform-origin: 50% 0%;
+	-webkit-transform-origin: 50% 0%; 		
+}
+
+@keyframes pullDown {
+	0% {
+		transform: scaleY(0.1);
+	}
+	40% {
+		transform: scaleY(1.02);
+	}
+	60% {
+		transform: scaleY(0.98);
+	}
+	80% {
+		transform: scaleY(1.01);
+	}
+	100% {
+		transform: scaleY(0.98);
+	}				
+	80% {
+		transform: scaleY(1.01);
+	}
+	100% {
+		transform: scaleY(1);
+	}							
+}
+
+@-webkit-keyframes pullDown {
+	0% {
+		-webkit-transform: scaleY(0.1);
+	}
+	40% {
+		-webkit-transform: scaleY(1.02);
+	}
+	60% {
+		-webkit-transform: scaleY(0.98);
+	}
+	80% {
+		-webkit-transform: scaleY(1.01);
+	}
+	100% {
+		-webkit-transform: scaleY(0.98);
+	}				
+	80% {
+		-webkit-transform: scaleY(1.01);
+	}
+	100% {
+		-webkit-transform: scaleY(1);
+	}		
+}
+
+/*
+==============================================
+stretchLeft
+==============================================
+*/
+
+.stretchLeft{
+	animation-name: stretchLeft;
+	-webkit-animation-name: stretchLeft;	
+
+	animation-duration: 1.5s;	
+	-webkit-animation-duration: 1.5s;
+
+	animation-timing-function: ease-out;	
+	-webkit-animation-timing-function: ease-out;	
+
+	transform-origin: 100% 0%;
+	-ms-transform-origin: 100% 0%;
+	-webkit-transform-origin: 100% 0%; 
+}
+
+@keyframes stretchLeft {
+	0% {
+		transform: scaleX(0.3);
+	}
+	40% {
+		transform: scaleX(1.02);
+	}
+	60% {
+		transform: scaleX(0.98);
+	}
+	80% {
+		transform: scaleX(1.01);
+	}
+	100% {
+		transform: scaleX(0.98);
+	}				
+	80% {
+		transform: scaleX(1.01);
+	}
+	100% {
+		transform: scaleX(1);
+	}							
+}
+
+@-webkit-keyframes stretchLeft {
+	0% {
+		-webkit-transform: scaleX(0.3);
+	}
+	40% {
+		-webkit-transform: scaleX(1.02);
+	}
+	60% {
+		-webkit-transform: scaleX(0.98);
+	}
+	80% {
+		-webkit-transform: scaleX(1.01);
+	}
+	100% {
+		-webkit-transform: scaleX(0.98);
+	}				
+	80% {
+		-webkit-transform: scaleX(1.01);
+	}
+	100% {
+		-webkit-transform: scaleX(1);
+	}		
+}
+
+/*
+==============================================
+stretchRight
+==============================================
+*/
+
+.stretchRight{
+	animation-name: stretchRight;
+	-webkit-animation-name: stretchRight;	
+
+	animation-duration: 1.5s;	
+	-webkit-animation-duration: 1.5s;
+
+	animation-timing-function: ease-out;	
+	-webkit-animation-timing-function: ease-out;	
+
+	transform-origin: 0% 0%;
+	-ms-transform-origin: 0% 0%;
+	-webkit-transform-origin: 0% 0%; 		
+}
+
+@keyframes stretchRight {
+	0% {
+		transform: scaleX(0.3);
+	}
+	40% {
+		transform: scaleX(1.02);
+	}
+	60% {
+		transform: scaleX(0.98);
+	}
+	80% {
+		transform: scaleX(1.01);
+	}
+	100% {
+		transform: scaleX(0.98);
+	}				
+	80% {
+		transform: scaleX(1.01);
+	}
+	100% {
+		transform: scaleX(1);
+	}							
+}
+
+@-webkit-keyframes stretchRight {
+	0% {
+		-webkit-transform: scaleX(0.3);
+	}
+	40% {
+		-webkit-transform: scaleX(1.02);
+	}
+	60% {
+		-webkit-transform: scaleX(0.98);
+	}
+	80% {
+		-webkit-transform: scaleX(1.01);
+	}
+	100% {
+		-webkit-transform: scaleX(0.98);
+	}				
+	80% {
+		-webkit-transform: scaleX(1.01);
+	}
+	100% {
+		-webkit-transform: scaleX(1);
+	}		
+}
+
+vendor/assets/stylesheets/normalize.css
+---
+/*! normalize.css v2.1.2 | MIT License | git.io/normalize */
+
+/* ==========================================================================
+   HTML5 display definitions
+   ========================================================================== */
+
+/**
+ * Correct `block` display not defined in IE 8/9.
+ */
+
+article,
+aside,
+details,
+figcaption,
+figure,
+footer,
+header,
+hgroup,
+main,
+nav,
+section,
+summary {
+    display: block;
+}
+
+/**
+ * Correct `inline-block` display not defined in IE 8/9.
+ */
+
+audio,
+canvas,
+video {
+    display: inline-block;
+}
+
+/**
+ * Prevent modern browsers from displaying `audio` without controls.
+ * Remove excess height in iOS 5 devices.
+ */
+
+audio:not([controls]) {
+    display: none;
+    height: 0;
+}
+
+/**
+ * Address styling not present in IE 8/9.
+ */
+
+[hidden] {
+    display: none;
+}
+
+/* ==========================================================================
+   Base
+   ========================================================================== */
+
+/**
+ * 1. Set default font family to sans-serif.
+ * 2. Prevent iOS text size adjust after orientation change, without disabling
+ *    user zoom.
+ */
+
+html {
+    font-family: sans-serif; /* 1 */
+    -ms-text-size-adjust: 100%; /* 2 */
+    -webkit-text-size-adjust: 100%; /* 2 */
+}
+
+/**
+ * Remove default margin.
+ */
+
+body {
+    margin: 0;
+}
+
+/* ==========================================================================
+   Links
+   ========================================================================== */
+
+/**
+ * Address `outline` inconsistency between Chrome and other browsers.
+ */
+
+a:focus {
+    outline: thin dotted;
+}
+
+/**
+ * Improve readability when focused and also mouse hovered in all browsers.
+ */
+
+a:active,
+a:hover {
+    outline: 0;
+}
+
+/* ==========================================================================
+   Typography
+   ========================================================================== */
+
+/**
+ * Address variable `h1` font-size and margin within `section` and `article`
+ * contexts in Firefox 4+, Safari 5, and Chrome.
+ */
+
+h1 {
+    font-size: 2em;
+    margin: 0.67em 0;
+}
+
+/**
+ * Address styling not present in IE 8/9, Safari 5, and Chrome.
+ */
+
+abbr[title] {
+    border-bottom: 1px dotted;
+}
+
+/**
+ * Address style set to `bolder` in Firefox 4+, Safari 5, and Chrome.
+ */
+
+b,
+strong {
+    font-weight: bold;
+}
+
+/**
+ * Address styling not present in Safari 5 and Chrome.
+ */
+
+dfn {
+    font-style: italic;
+}
+
+/**
+ * Address differences between Firefox and other browsers.
+ */
+
+hr {
+    -moz-box-sizing: content-box;
+    box-sizing: content-box;
+    height: 0;
+}
+
+/**
+ * Address styling not present in IE 8/9.
+ */
+
+mark {
+    background: #ff0;
+    color: #000;
+}
+
+/**
+ * Correct font family set oddly in Safari 5 and Chrome.
+ */
+
+code,
+kbd,
+pre,
+samp {
+    font-family: monospace, serif;
+    font-size: 1em;
+}
+
+/**
+ * Improve readability of pre-formatted text in all browsers.
+ */
+
+pre {
+    white-space: pre-wrap;
+}
+
+/**
+ * Set consistent quote types.
+ */
+
+q {
+    quotes: "\201C" "\201D" "\2018" "\2019";
+}
+
+/**
+ * Address inconsistent and variable font size in all browsers.
+ */
+
+small {
+    font-size: 80%;
+}
+
+/**
+ * Prevent `sub` and `sup` affecting `line-height` in all browsers.
+ */
+
+sub,
+sup {
+    font-size: 75%;
+    line-height: 0;
+    position: relative;
+    vertical-align: baseline;
+}
+
+sup {
+    top: -0.5em;
+}
+
+sub {
+    bottom: -0.25em;
+}
+
+/* ==========================================================================
+   Embedded content
+   ========================================================================== */
+
+/**
+ * Remove border when inside `a` element in IE 8/9.
+ */
+
+img {
+    border: 0;
+}
+
+/**
+ * Correct overflow displayed oddly in IE 9.
+ */
+
+svg:not(:root) {
+    overflow: hidden;
+}
+
+/* ==========================================================================
+   Figures
+   ========================================================================== */
+
+/**
+ * Address margin not present in IE 8/9 and Safari 5.
+ */
+
+figure {
+    margin: 0;
+}
+
+/* ==========================================================================
+   Forms
+   ========================================================================== */
+
+/**
+ * Define consistent border, margin, and padding.
+ */
+
+fieldset {
+    border: 1px solid #c0c0c0;
+    margin: 0 2px;
+    padding: 0.35em 0.625em 0.75em;
+}
+
+/**
+ * 1. Correct `color` not being inherited in IE 8/9.
+ * 2. Remove padding so people aren't caught out if they zero out fieldsets.
+ */
+
+legend {
+    border: 0; /* 1 */
+    padding: 0; /* 2 */
+}
+
+/**
+ * 1. Correct font family not being inherited in all browsers.
+ * 2. Correct font size not being inherited in all browsers.
+ * 3. Address margins set differently in Firefox 4+, Safari 5, and Chrome.
+ */
+
+button,
+input,
+select,
+textarea {
+    font-family: inherit; /* 1 */
+    font-size: 100%; /* 2 */
+    margin: 0; /* 3 */
+}
+
+/**
+ * Address Firefox 4+ setting `line-height` on `input` using `!important` in
+ * the UA stylesheet.
+ */
+
+button,
+input {
+    line-height: normal;
+}
+
+/**
+ * Address inconsistent `text-transform` inheritance for `button` and `select`.
+ * All other form control elements do not inherit `text-transform` values.
+ * Correct `button` style inheritance in Chrome, Safari 5+, and IE 8+.
+ * Correct `select` style inheritance in Firefox 4+ and Opera.
+ */
+
+button,
+select {
+    text-transform: none;
+}
+
+/**
+ * 1. Avoid the WebKit bug in Android 4.0.* where (2) destroys native `audio`
+ *    and `video` controls.
+ * 2. Correct inability to style clickable `input` types in iOS.
+ * 3. Improve usability and consistency of cursor style between image-type
+ *    `input` and others.
+ */
+
+button,
+html input[type="button"], /* 1 */
+input[type="reset"],
+input[type="submit"] {
+    -webkit-appearance: button; /* 2 */
+    cursor: pointer; /* 3 */
+}
+
+/**
+ * Re-set default cursor for disabled elements.
+ */
+
+button[disabled],
+html input[disabled] {
+    cursor: default;
+}
+
+/**
+ * 1. Address box sizing set to `content-box` in IE 8/9.
+ * 2. Remove excess padding in IE 8/9.
+ */
+
+input[type="checkbox"],
+input[type="radio"] {
+    box-sizing: border-box; /* 1 */
+    padding: 0; /* 2 */
+}
+
+/**
+ * 1. Address `appearance` set to `searchfield` in Safari 5 and Chrome.
+ * 2. Address `box-sizing` set to `border-box` in Safari 5 and Chrome
+ *    (include `-moz` to future-proof).
+ */
+
+input[type="search"] {
+    -webkit-appearance: textfield; /* 1 */
+    -moz-box-sizing: content-box;
+    -webkit-box-sizing: content-box; /* 2 */
+    box-sizing: content-box;
+}
+
+/**
+ * Remove inner padding and search cancel button in Safari 5 and Chrome
+ * on OS X.
+ */
+
+input[type="search"]::-webkit-search-cancel-button,
+input[type="search"]::-webkit-search-decoration {
+    -webkit-appearance: none;
+}
+
+/**
+ * Remove inner padding and border in Firefox 4+.
+ */
+
+button::-moz-focus-inner,
+input::-moz-focus-inner {
+    border: 0;
+    padding: 0;
+}
+
+/**
+ * 1. Remove default vertical scrollbar in IE 8/9.
+ * 2. Improve readability and alignment in all browsers.
+ */
+
+textarea {
+    overflow: auto; /* 1 */
+    vertical-align: top; /* 2 */
+}
+
+/* ==========================================================================
+   Tables
+   ========================================================================== */
+
+/**
+ * Remove most spacing between table cells.
+ */
+
+table {
+    border-collapse: collapse;
+    border-spacing: 0;
+}
+vendor/assets/stylesheets/pure.css
+---
+/*!
+Pure v0.2.0
+Copyright 2013 Yahoo! Inc. All rights reserved.
+Licensed under the BSD License.
+https://github.com/yui/pure/blob/master/LICENSE.md
+*/
+/*!
+normalize.css v1.1.2 | MIT License | git.io/normalize
+Copyright (c) Nicolas Gallagher and Jonathan Neal
+*/
+/*! normalize.css v1.1.2 | MIT License | git.io/normalize */article,aside,details,figcaption,figure,footer,header,hgroup,main,nav,section,summary{display:block}audio,canvas,video{display:inline-block;*display:inline;*zoom:1}audio:not([controls]){display:none;height:0}[hidden]{display:none}html{font-size:100%;-ms-text-size-adjust:100%;-webkit-text-size-adjust:100%}html,button,input,select,textarea{font-family:sans-serif}body{margin:0}a:focus{outline:thin dotted}a:active,a:hover{outline:0}h1{font-size:2em;margin:.67em 0}h2{font-size:1.5em;margin:.83em 0}h3{font-size:1.17em;margin:1em 0}h4{font-size:1em;margin:1.33em 0}h5{font-size:.83em;margin:1.67em 0}h6{font-size:.67em;margin:2.33em 0}abbr[title]{border-bottom:1px dotted}b,strong{font-weight:700}blockquote{margin:1em 40px}dfn{font-style:italic}hr{-moz-box-sizing:content-box;box-sizing:content-box;height:0}mark{background:#ff0;color:#000}p,pre{margin:1em 0}code,kbd,pre,samp{font-family:monospace,serif;_font-family:'courier new',monospace;font-size:1em}pre{white-space:pre;white-space:pre-wrap;word-wrap:break-word}q{quotes:none}q:before,q:after{content:'';content:none}small{font-size:80%}sub,sup{font-size:75%;line-height:0;position:relative;vertical-align:baseline}sup{top:-.5em}sub{bottom:-.25em}dl,menu,ol,ul{margin:1em 0}dd{margin:0 0 0 40px}menu,ol,ul{padding:0 0 0 1em}nav ul,nav ol{list-style:none;list-style-image:none}img{border:0;-ms-interpolation-mode:bicubic}svg:not(:root){overflow:hidden}figure{margin:0}form{margin:0}fieldset{border:1px solid silver;margin:0 2px;padding:.35em .625em .75em}legend{border:0;padding:0;white-space:normal;*margin-left:-7px}button,input,select,textarea{font-size:100%;margin:0;vertical-align:baseline;*vertical-align:middle}button,input{line-height:normal}button,select{text-transform:none}button,html input[type=button],input[type=reset],input[type=submit]{-webkit-appearance:button;cursor:pointer;*overflow:visible}button[disabled],html input[disabled]{cursor:default}input[type=checkbox],input[type=radio]{box-sizing:border-box;padding:0;*height:13px;*width:13px}input[type=search]{-webkit-appearance:textfield;-moz-box-sizing:content-box;-webkit-box-sizing:content-box;box-sizing:content-box}input[type=search]::-webkit-search-cancel-button,input[type=search]::-webkit-search-decoration{-webkit-appearance:none}button::-moz-focus-inner,input::-moz-focus-inner{border:0;padding:0}textarea{overflow:auto;vertical-align:top}table{border-collapse:collapse;border-spacing:0}
+.pure-button{display:inline-block;*display:inline;zoom:1;line-height:normal;white-space:nowrap;vertical-align:baseline;text-align:center;cursor:pointer;-webkit-user-drag:none;-webkit-user-select:none;-moz-user-select:none;-ms-user-select:none;user-select:none}.pure-button::-moz-focus-inner{padding:0;border:0}.pure-button{font-size:100%;*font-size:90%;*overflow:visible;padding:.5em 1.5em;color:#444;color:rgba(0,0,0,.8);*color:#444;border:1px solid #999;border:0 rgba(0,0,0,0);background-color:#E6E6E6;text-decoration:none;border-radius:2px;-webkit-font-smoothing:antialiased;-webkit-transition:.1s linear -webkit-box-shadow;-moz-transition:.1s linear -moz-box-shadow;-ms-transition:.1s linear box-shadow;-o-transition:.1s linear box-shadow;transition:.1s linear box-shadow}.pure-button-hover,.pure-button:hover,.pure-button:focus{filter:progid:DXImageTransform.Microsoft.gradient(startColorstr='#00000000', endColorstr='#1a000000', GradientType=0);background-image:-webkit-gradient(linear,0 0,0 100%,from(transparent),color-stop(40%,rgba(0,0,0,.05)),to(rgba(0,0,0,.1)));background-image:-webkit-linear-gradient(transparent,rgba(0,0,0,.05) 40%,rgba(0,0,0,.1));background-image:-moz-linear-gradient(top,rgba(0,0,0,.05) 0,rgba(0,0,0,.1));background-image:-ms-linear-gradient(transparent,rgba(0,0,0,.05) 40%,rgba(0,0,0,.1));background-image:-o-linear-gradient(transparent,rgba(0,0,0,.05) 40%,rgba(0,0,0,.1));background-image:linear-gradient(transparent,rgba(0,0,0,.05) 40%,rgba(0,0,0,.1))}.pure-button:focus{outline:0}.pure-button-active,.pure-button:active{box-shadow:0 0 0 1px rgba(0,0,0,.15) inset,0 0 6px rgba(0,0,0,.2) inset}.pure-button[disabled],.pure-button-disabled,.pure-button-disabled:hover,.pure-button-disabled:focus,.pure-button-disabled:active{border:0;background-image:none;filter:progid:DXImageTransform.Microsoft.gradient(enabled=false);filter:alpha(opacity=40);-khtml-opacity:.4;-moz-opacity:.4;opacity:.4;cursor:not-allowed;box-shadow:none}.pure-button-hidden{display:none}.pure-button::-moz-focus-inner{padding:0;border:0}.pure-button-primary,.pure-button-selected,a.pure-button-primary,a.pure-button-selected{background-color:#0078e7;color:#fff}
+.pure-form{margin:0}.pure-form fieldset{border:1px solid silver;margin:0 2px;padding:.35em .625em .75em}.pure-form legend{border:0;padding:0;white-space:normal;*margin-left:-7px}.pure-form button,.pure-form input,.pure-form select,.pure-form textarea{font-size:100%;margin:0;vertical-align:baseline;*vertical-align:middle}.pure-form button,.pure-form input{line-height:normal}.pure-form button,.pure-form input[type=button],.pure-form input[type=reset],.pure-form input[type=submit]{-webkit-appearance:button;cursor:pointer;*overflow:visible}.pure-form button[disabled],.pure-form input[disabled]{cursor:default}.pure-form input[type=checkbox],.pure-form input[type=radio]{box-sizing:border-box;padding:0;*height:13px;*width:13px}.pure-form input[type=search]{-webkit-appearance:textfield;-moz-box-sizing:content-box;-webkit-box-sizing:content-box;box-sizing:content-box}.pure-form input[type=search]::-webkit-search-cancel-button,.pure-form input[type=search]::-webkit-search-decoration{-webkit-appearance:none}.pure-form button::-moz-focus-inner,.pure-form input::-moz-focus-inner{border:0;padding:0}.pure-form textarea{overflow:auto;vertical-align:top}.pure-form input[type=text],.pure-form input[type=password],.pure-form input[type=email],.pure-form input[type=url],.pure-form input[type=date],.pure-form input[type=month],.pure-form input[type=time],.pure-form input[type=datetime],.pure-form input[type=datetime-local],.pure-form input[type=week],.pure-form input[type=number],.pure-form input[type=search],.pure-form input[type=tel],.pure-form input[type=color],.pure-form select,.pure-form textarea{padding:.5em .6em;display:inline-block;border:1px solid #ccc;font-size:.8em;box-shadow:inset 0 1px 3px #ddd;border-radius:4px;-webkit-transition:.3s linear border;-moz-transition:.3s linear border;-ms-transition:.3s linear border;-o-transition:.3s linear border;transition:.3s linear border;-webkit-box-sizing:border-box;-moz-box-sizing:border-box;box-sizing:border-box;-webkit-font-smoothing:antialiased}.pure-form input[type=text]:focus,.pure-form input[type=password]:focus,.pure-form input[type=email]:focus,.pure-form input[type=url]:focus,.pure-form input[type=date]:focus,.pure-form input[type=month]:focus,.pure-form input[type=time]:focus,.pure-form input[type=datetime]:focus,.pure-form input[type=datetime-local]:focus,.pure-form input[type=week]:focus,.pure-form input[type=number]:focus,.pure-form input[type=search]:focus,.pure-form input[type=tel]:focus,.pure-form input[type=color]:focus,.pure-form select:focus,.pure-form textarea:focus{outline:0;outline:thin dotted \9;border-color:#129FEA}.pure-form input[type=file]:focus,.pure-form input[type=radio]:focus,.pure-form input[type=checkbox]:focus{outline:thin dotted #333;outline:1px auto #129FEA}.pure-form .pure-checkbox,.pure-form .pure-radio{margin:.5em 0;display:block}.pure-form input[type=text][disabled],.pure-form input[type=password][disabled],.pure-form input[type=email][disabled],.pure-form input[type=url][disabled],.pure-form input[type=date][disabled],.pure-form input[type=month][disabled],.pure-form input[type=time][disabled],.pure-form input[type=datetime][disabled],.pure-form input[type=datetime-local][disabled],.pure-form input[type=week][disabled],.pure-form input[type=number][disabled],.pure-form input[type=search][disabled],.pure-form input[type=tel][disabled],.pure-form input[type=color][disabled],.pure-form select[disabled],.pure-form textarea[disabled],.pure-form input[readonly],.pure-form select[readonly],.pure-form textarea[readonly]{cursor:not-allowed;background-color:#eaeded;color:#cad2d3;border-color:transparent}.pure-form input:focus:invalid,.pure-form textarea:focus:invalid,.pure-form select:focus:invalid{color:#b94a48;border:1px solid #ee5f5b}.pure-form input:focus:invalid:focus,.pure-form textarea:focus:invalid:focus,.pure-form select:focus:invalid:focus{border-color:#e9322d}.pure-form input[type=file]:focus:invalid:focus,.pure-form input[type=radio]:focus:invalid:focus,.pure-form input[type=checkbox]:focus:invalid:focus{outline-color:#e9322d}.pure-form select{border:1px solid #ccc;background-color:#fff}.pure-form select[multiple]{height:auto}.pure-form label{margin:.5em 0 .2em;color:#999;font-size:90%}.pure-form fieldset{margin:0;padding:.35em 0 .75em;border:0}.pure-form legend{display:block;width:100%;padding:.3em 0;margin-bottom:.3em;font-size:125%;color:#333;border-bottom:1px solid #e5e5e5}.pure-form-stacked input[type=text],.pure-form-stacked input[type=password],.pure-form-stacked input[type=email],.pure-form-stacked input[type=url],.pure-form-stacked input[type=date],.pure-form-stacked input[type=month],.pure-form-stacked input[type=time],.pure-form-stacked input[type=datetime],.pure-form-stacked input[type=datetime-local],.pure-form-stacked input[type=week],.pure-form-stacked input[type=number],.pure-form-stacked input[type=search],.pure-form-stacked input[type=tel],.pure-form-stacked input[type=color],.pure-form-stacked select,.pure-form-stacked label{display:block}.pure-form-aligned input,.pure-form-aligned textarea,.pure-form-aligned select,.pure-form-aligned .pure-help-inline,.pure-form-message-inline{display:inline-block;*display:inline;*zoom:1;vertical-align:middle}.pure-form-aligned .pure-control-group{margin-bottom:.5em}.pure-form-aligned .pure-control-group label{text-align:right;display:inline-block;vertical-align:middle;width:10em;margin:0 1em 0 0}.pure-form-aligned .pure-controls{margin:1.5em 0 0 10em}.pure-form .pure-input-rounded{border-radius:20px;padding-left:1em}.pure-form .pure-group fieldset{margin-bottom:10px}.pure-form .pure-group input{display:block;padding:10px;margin:0;border-radius:0;position:relative;top:-1px}.pure-form .pure-group input:focus{z-index:2}.pure-form .pure-group input:first-child{top:1px;border-radius:4px 4px 0 0}.pure-form .pure-group input:last-child{top:-2px;border-radius:0 0 4px 4px}.pure-form .pure-group button{margin:.35em 0}.pure-form .pure-input-1{width:100%}.pure-form .pure-input-2-3{width:66%}.pure-form .pure-input-1-2{height:2.69em;width:50%}.pure-form .pure-input-1-3{width:33%}.pure-form .pure-input-1-4{width:25%}.pure-form .pure-help-inline,.pure-form-message-inline{display:inline-block;padding-left:.3em;color:#666;vertical-align:middle;font-size:90%}.pure-form-message{display:block;color:#666;font-size:90%}@media only screen and (max-width :480px){.pure-form button[type=submit]{margin:.7em 0 0}.pure-form input[type=text],.pure-form input[type=password],.pure-form input[type=email],.pure-form input[type=url],.pure-form input[type=date],.pure-form input[type=month],.pure-form input[type=time],.pure-form input[type=datetime],.pure-form input[type=datetime-local],.pure-form input[type=week],.pure-form input[type=number],.pure-form input[type=search],.pure-form input[type=tel],.pure-form input[type=color],.pure-form label{margin-bottom:.3em;display:block}.pure-group input[type=text],.pure-form input[type=password],.pure-form input[type=email],.pure-form input[type=url],.pure-form input[type=date],.pure-form input[type=month],.pure-form input[type=time],.pure-form input[type=datetime],.pure-form input[type=datetime-local],.pure-form input[type=week],.pure-form input[type=number],.pure-form input[type=search],.pure-form input[type=tel],.pure-form input[type=color]{margin-bottom:0}.pure-form-aligned .pure-control-group label{margin-bottom:.3em;text-align:left;display:block;width:100%}.pure-form-aligned .pure-controls{margin:1.5em 0 0}.pure-form .pure-help-inline,.pure-form-message-inline,.pure-form-message{display:block;font-size:80%;padding:.2em 0 .8em}}
+.pure-g{letter-spacing:-.31em;*letter-spacing:normal;*word-spacing:-.43em;text-rendering:optimizespeed}.opera-only :-o-prefocus,.pure-g{word-spacing:-.43em}.pure-u{display:inline-block;*display:inline;zoom:1;letter-spacing:normal;word-spacing:normal;vertical-align:top;text-rendering:auto}.pure-u-1,.pure-u-1-2,.pure-u-1-3,.pure-u-2-3,.pure-u-1-4,.pure-u-3-4,.pure-u-1-5,.pure-u-2-5,.pure-u-3-5,.pure-u-4-5,.pure-u-1-6,.pure-u-5-6,.pure-u-1-8,.pure-u-3-8,.pure-u-5-8,.pure-u-7-8,.pure-u-1-12,.pure-u-5-12,.pure-u-7-12,.pure-u-11-12,.pure-u-1-24,.pure-u-5-24,.pure-u-7-24,.pure-u-11-24,.pure-u-13-24,.pure-u-17-24,.pure-u-19-24,.pure-u-23-24{display:inline-block;*display:inline;zoom:1;letter-spacing:normal;word-spacing:normal;vertical-align:top;text-rendering:auto}.pure-u-1{display:block}.pure-u-1-2{width:50%}.pure-u-1-3{width:33.33333%}.pure-u-2-3{width:66.66666%}.pure-u-1-4{width:25%}.pure-u-3-4{width:75%}.pure-u-1-5{width:20%}.pure-u-2-5{width:40%}.pure-u-3-5{width:60%}.pure-u-4-5{width:80%}.pure-u-1-6{width:16.656%}.pure-u-5-6{width:83.33%}.pure-u-1-8{width:12.5%}.pure-u-3-8{width:37.5%}.pure-u-5-8{width:62.5%}.pure-u-7-8{width:87.5%}.pure-u-1-12{width:8.3333%}.pure-u-5-12{width:41.6666%}.pure-u-7-12{width:58.3333%}.pure-u-11-12{width:91.6666%}.pure-u-1-24{width:4.1666%}.pure-u-5-24{width:20.8333%}.pure-u-7-24{width:29.1666%}.pure-u-11-24{width:45.8333%}.pure-u-13-24{width:54.1666%}.pure-u-17-24{width:70.8333%}.pure-u-19-24{width:79.1666%}.pure-u-23-24{width:95.8333%}.pure-g-r{letter-spacing:-.31em;*letter-spacing:normal;*word-spacing:-.43em}.opera-only :-o-prefocus,.pure-g-r{word-spacing:-.43em}.pure-g-r img{max-width:100%}@media (min-width:980px){.pure-visible-phone{display:none}.pure-visible-tablet{display:none}.pure-hidden-desktop{display:none}}@media (max-width:480px){.pure-g-r>.pure-u,.pure-g-r>[class *="pure-u-"]{width:100%}}@media (max-width:767px){.pure-g-r>.pure-u,.pure-g-r>[class *="pure-u-"]{width:100%}.pure-hidden-phone{display:none}.pure-visible-desktop{display:none}}@media (min-width:768px) and (max-width:979px){.pure-hidden-tablet{display:none}.pure-visible-desktop{display:none}}
+.pure-menu ul{position:absolute;visibility:hidden}.pure-menu.pure-menu-open{visibility:visible;z-index:2;width:100%}.pure-menu ul{left:-10000px;list-style:none;margin:0;padding:0;top:-10000px;z-index:1}.pure-menu>ul{position:relative}.pure-menu-open>ul{left:0;top:0;visibility:visible}.pure-menu-open>ul:focus{outline:0}.pure-menu li{position:relative}.pure-menu a,.pure-menu .pure-menu-heading{display:block;color:inherit;line-height:1.5em;padding:5px 20px;text-decoration:none;white-space:nowrap}.pure-menu.pure-menu-horizontal>.pure-menu-heading{display:inline-block;*display:inline;zoom:1;margin:0;vertical-align:middle}.pure-menu.pure-menu-horizontal>ul{display:inline-block;*display:inline;zoom:1;vertical-align:middle;height:2.4em}.pure-menu li a{padding:5px 20px}.pure-menu-can-have-children>.pure-menu-label:after{content:'\25B8';float:right;font-family:'Lucida Grande','Lucida Sans Unicode','DejaVu Sans',sans-serif;margin-right:-20px;margin-top:-1px}.pure-menu-can-have-children>.pure-menu-label{padding-right:30px}.pure-menu-separator{background-color:#dfdfdf;display:block;height:1px;font-size:0;margin:7px 2px;overflow:hidden}.pure-menu-hidden{display:none}.pure-menu-fixed{position:fixed;top:0;left:0;width:100%}.pure-menu-horizontal li{display:inline-block;*display:inline;zoom:1;vertical-align:middle}.pure-menu-horizontal li li{display:block}.pure-menu-horizontal>.pure-menu-children>.pure-menu-can-have-children>.pure-menu-label:after{content:"\25BE"}.pure-menu-horizontal>.pure-menu-children>.pure-menu-can-have-children>.pure-menu-label{padding-right:30px}.pure-menu-horizontal li.pure-menu-separator{height:50%;width:1px;margin:0 7px}.pure-menu-horizontal li li.pure-menu-separator{height:1px;width:auto;margin:7px 2px}.pure-menu.pure-menu-open,.pure-menu.pure-menu-horizontal li .pure-menu-children{background:#fff;border:1px solid #b7b7b7}.pure-menu.pure-menu-horizontal,.pure-menu.pure-menu-horizontal .pure-menu-heading{border:0}.pure-menu a{border:1px solid transparent;border-left:0;border-right:0}.pure-menu a,.pure-menu .pure-menu-can-have-children>li:after{color:#777}.pure-menu .pure-menu-can-have-children>li:hover:after{color:#fff}.pure-menu .pure-menu-open{background:#dedede}.pure-menu li a:hover,.pure-menu li a:focus{background:#eee}.pure-menu li.pure-menu-disabled a:hover,.pure-menu li.pure-menu-disabled a:focus{background:#fff;color:#bfbfbf}.pure-menu .pure-menu-disabled>a{background-image:none;border-color:transparent;cursor:default}.pure-menu .pure-menu-disabled>a,.pure-menu .pure-menu-can-have-children.pure-menu-disabled>a:after{color:#bfbfbf}.pure-menu .pure-menu-heading{color:#565d64;text-transform:uppercase;font-size:90%;margin-top:.5em;border-bottom-width:1px;border-bottom-style:solid;border-bottom-color:#dfdfdf}.pure-menu .pure-menu-selected a{color:#000}.pure-menu.pure-menu-open.pure-menu-fixed{border:0;border-bottom:1px solid #b7b7b7}.pure-paginator{list-style:none;margin:0;padding:0}.pure-paginator li{display:inline-block;*display:inline;zoom:1;margin:0 -.35em 0 0}.pure-paginator .pure-button{border-radius:0;padding:.8em 1.4em;vertical-align:top;height:1.1em}.pure-paginator .pure-button:focus{outline-style:none}.pure-paginator .prev,.pure-paginator .next{color:#C0C1C3;text-shadow:0 -1px 0 rgba(0,0,0,.45)}.pure-paginator .prev{border-radius:2px 0 0 2px}.pure-paginator .next{border-radius:0 2px 2px 0}@media (max-width:480px){.pure-menu-horizontal{width:100%}.pure-menu-children li{display:block;border-bottom:1px solid #000}}
+.pure-table{border-collapse:collapse;border-spacing:0;empty-cells:show;border:1px solid #cbcbcb}.pure-table caption{color:#000;font:italic 85%/1 arial,sans-serif;padding:1em 0;text-align:center}.pure-table td,.pure-table th{border-left:1px solid #cbcbcb;border-width:0 0 0 1px;font-size:inherit;margin:0;overflow:visible;padding:6px 12px}.pure-table td:first-child,.pure-table th:first-child{border-left-width:0}.pure-table thead{background:#e0e0e0;color:#000;text-align:left;vertical-align:bottom;white-space:nowrap}.pure-table td{background-color:transparent}.pure-table-odd td{background-color:#f2f2f2}.pure-table-striped tr:nth-child(2n-1) td{background-color:#f2f2f2}.pure-table-bordered td{border-bottom:1px solid #cbcbcb}.pure-table-bordered tbody>tr:last-child td,.pure-table-horizontal tbody>tr:last-child td{border-bottom-width:0}.pure-table-horizontal td,.pure-table-horizontal th{border-width:0 0 1px;border-bottom:1px solid #cbcbcb}.pure-table-horizontal tbody>tr:last-child td{border-bottom-width:0}
+app/assets/stylesheets/application.css.scss
+---
+/*
+ * This is a manifest file that'll be compiled into application.css, which will include all the files
+ * listed below.
+ *
+ * Any CSS and SCSS file within this directory, lib/assets/stylesheets, vendor/assets/stylesheets,
+ * or vendor/assets/stylesheets of plugins, if any, can be referenced here using a relative path.
+ *
+ * You're free to add application-wide styles to this file and they'll appear at the top of the
+ * compiled file, but it's generally better to create a new file per style scope.
+ *
+ *= require_self
+ *= require_tree ../../../vendor/assets/stylesheets/.
+ *= require_tree .
+*/
+
+.content {
+  background-color: #eee;
+  padding: 20px;
+  margin: 0 -20px;
+  -webkit-border-radius: 0 0 6px 6px;
+  -moz-border-radius: 0 0 6px 6px;
+  border-radius: 0 0 6px 6px;
+  -webkit-box-shadow: 0 1px 2px rgba(0,0,0,.15);
+  -moz-box-shadow: 0 1px 2px rgba(0,0,0,.15);
+  box-shadow: 0 1px 2px rgba(0,0,0,.15);
+}
+
+app/assets/stylesheets/forms.css.scss
+---
+.form-title{
+	margin-left: 12em;
+}
+
+.new_user{
+  margin: 6em auto;
+	width: 50%;
+	input {
+		width: 99%;
+		margin: 0 auto;
+		display: block;
+	}
+	input[type="email"], input[type="password"] {
+		padding: 4px 0px;
+		text-indent: 6px;
+	}
+}
+
+.off-name{
+  margin-bottom: 2em;
+}
+
+.email{
+  margin-top: -1.2em;
+	input {
+		height: 3em;
+		margin-bottom: 1px;
+	}
+}
+
+.password{
+  margin-top: 1.8em;
+	input {
+		height: 3em;
+	  margin-bottom: 1px;
+	}
+}
+
+.password-confirm{
+  margin-top: 1.7em;
+	input {
+		height: 3em;
+	}
+}
+
+.actions{
+  margin-top: 1.7em;
+	a {
+		width: 50%;
+		margin: 0 auto;
+		display: block;
+	}
+	a:hover {
+		text-decoration: none;
+	}
+}
+
+.pure-form-aligned .pure-control-group label {
+  text-align: right;
+  display: inline-block;
+  vertical-align: middle;
+  width: 11em;
+  margin: 0 1em 0 0;
+}
+
+#search{
+  margin-left: 16em;
+  width: 60%;
+  float: left;
+  margin-top: 1em;
+  text-align: center;
+  padding: 0.5em;
+  position: absolute;
+}
+
+.pure-input-1-2:focus{
+  border: 1px solid green;
+}
+
+input[type=submit] {
+  -webkit-appearance: button;
+  cursor: pointer;
+	font-size: 1.3em;
+}
+
+input[type="text"]{
+  height:3em;
+  margin-right: 1em;
+}
+
+app/assets/stylesheets/main.css.scss
+---
+html {
+  height: 100%;
+}
+
+body {
+  font-family: "Oxygen", Helvetica, Arial, sans-serif;
+  margin: 0;
+  font-size: 16px;
+  line-height: 20px;
+  color: #333333;
+}
+
+.container{
+  margin-top: -0.5em;
+  max-width: 1024px;
+}
+
+.span12 {
+  margin-top: 6.5em;
+  width: 1024px;
+  margin-right: auto;
+  margin-left: auto;
+  min-height: 55em;
+  border-radius: .5em;
+  background-color: #EFEFEF;
+  margin-bottom: 3em;
+}
+
+.field_with_errors{
+  display: inline-block;
+  color: red;
+}
+
+ul{
+  padding-top: 1em;
+  padding-bottom: 0;
+}
+
+.nav {
+  position: fixed;
+  top: 0;
+  z-index: 3;
+}
+
+.navbar .nav{
+  float:right;
+  margin-right: 0;
+}
+
+.navbar .nav > li > a:hover{
+  color: #20AC37;
+  background: #f0f0f0;
+  background: -moz-linear-gradient(top,  #f0f0f0 0%, #e3e3e3 50%, #d4d4d4 51%, #e7e7e7 100%);
+  background: -webkit-gradient(linear, left top, left bottom, color-stop(0%,#f0f0f0), color-stop(50%,#e3e3e3), color-stop(51%,#d4d4d4), color-stop(100%,#e7e7e7));
+  background: -webkit-linear-gradient(top,  #f0f0f0 0%,#e3e3e3 50%,#d4d4d4 51%,#e7e7e7 100%);
+}
+
+.navbar #brand {
+  margin-left: 0em;
+  visibility: hidden;
+  float: left;
+  padding: 10px 0 10px 0;
+}
+
+.selected #rate{
+  background: -moz-linear-gradient(top,  rgba(255,255,255,0) 0%, rgba(255,255,255,0.83) 83%, rgba(21,165,26,1) 100%);
+  background: -webkit-gradient(linear, left top, left bottom, color-stop(0%,rgba(255,255,255,0)), color-stop(83%,rgba(255,255,255,0.83)), color-stop(100%,rgba(21,165,26,1)));
+  background: -webkit-linear-gradient(top,  rgba(255,255,255,0) 0%,rgba(255,255,255,0.83) 83%,rgba(21,165,26,1) 100%);
+  color:green !important;
+}
+
+.selected {
+  background: -moz-linear-gradient(top,  rgba(255,255,255,0) 0%, rgba(255,255,255,0.83) 83%, rgba(21,165,26,1) 100%);
+  background: -webkit-gradient(linear, left top, left bottom, color-stop(0%,rgba(255,255,255,0)), color-stop(83%,rgba(255,255,255,0.83)), color-stop(100%,rgba(21,165,26,1)));
+  background: -webkit-linear-gradient(top,  rgba(255,255,255,0) 0%,rgba(255,255,255,0.83) 83%,rgba(21,165,26,1) 100%);
+  color:green !important;
+}
+
+.navbar .nav > li > a {
+  float: none;
+  padding: 10px 15px 10px;
+  color: #777777;
+  text-decoration: none;
+  text-shadow: 0 0px 0 white;
+}
+
+.movie-list{
+  clear: both;
+  padding: 0em;
+  text-align: center;
+  width: 100%;
+  clear: both;
+  margin-top: 1em;
+
+  .ratings-movie {
+    background-color: white;
+    padding: .5em;
+    text-align: center;
+    display: inline-table;
+    width: 20%;
+    margin: 0.5em;
+    height: 376px;
+    -webkit-box-shadow: 0px 0px 12px rgba(0, 0, 0, 0.4);
+    -moz-box-shadow: 0px 1px 6px rgba(23, 69, 88, .5);
+
+    .poster{
+      height: 300px !important;
+      width: 213px !important;
+      overflow: hidden;
+      img {
+        height: 300px !important;
+        width: 213px !important;
+      }
+    }
+    .title {
+      margin-top: 10px;
+
+      a {
+        color: black;
+        text-decoration: none;
+      }
+    }
+    .rating {
+      a {
+        color: #20AC37;
+        text-decoration: none;
+      }
+    }
+    span {
+      margin-right: 5px;
+    }
+  }
+}
+
+.rating > a {
+  display: inline-block;
+  position: relative;
+  width: 1.1em;
+}
+
+.rating > a:hover {
+  text-decoration: none;
+}
+
+#main {
+  overflow:auto;
+}
+
+#stars{
+  width: 100%;
+  position: relative;
+}
+
+.navbar .nav {
+  // position: absolute;
+}
+
+app/assets/stylesheets/pure-custom.css.scss
+---
+body {
+    background-color: #ffffff;
+}
+
+/* from YUICSS buttons-core.css */
+.pure-button {
+    /* Structure */
+    display: inline-block;
+    *display: inline; /*IE 6/7*/
+    zoom: 1;
+    line-height: normal;
+    white-space: nowrap;
+    vertical-align: baseline;
+    text-align: center;
+    cursor: pointer;
+    -webkit-user-drag: none;
+    -webkit-user-select: none;
+    -moz-user-select: none;
+    -ms-user-select: none;
+    user-select: none;
+}
+
+/* Firefox: Get rid of the inner focus border */
+.pure-button::-moz-focus-inner{
+    padding: 0;
+    border: 0;
+}
+/* end from YUICSS buttons-core.css */
+/* from YUICSS buttons.css */
+/*csslint unqualified-attributes:false*/
+
+.pure-button {
+    font-size: 100%;
+    *font-size: 90%; /*IE 6/7 - To reduce IE's oversized button text*/
+    *overflow: visible; /*IE 6/7 - Because of IE's overly large left/right padding on buttons */
+    padding: 0.5em 1.5em 0.5em;
+    color: #0c2210; /* rgba not supported (IE 8) */
+    /* color: rgba(0, 0, 0, 0.80); rgba supported */
+    /* *color: #444; IE 6 & 7 */
+    border: 1px solid #86d593; /*IE 6/7/8*/
+    border: none rgba(0, 0, 0, 0); /*IE9 + everything else*/
+    background-color: #a1deab;
+    border-radius: 2px;
+    text-decoration: none;
+    -webkit-font-smoothing: antialiased;
+    /* Transitions */
+    -webkit-transition: 0.1s linear -webkit-box-shadow;
+    -moz-transition: 0.1s linear -moz-box-shadow;
+    -ms-transition: 0.1s linear box-shadow;
+    -o-transition: 0.1s linear box-shadow;
+    transition: 0.1s linear box-shadow;
+}
+
+.pure-button-hover,
+.pure-button:hover {
+    filter: progid:DXImageTransform.Microsoft.gradient(startColorstr='#00000000', endColorstr='#00000000', GradientType=0);
+    background-image: -webkit-gradient(linear, 0 0, 0 100%, from(transparent), color-stop(40%, rgba(0,0,0, 0.05)), to(rgba(0,0,0, 0.05)));
+    background-image: -webkit-linear-gradient(transparent, rgba(0,0,0, 0.05) 40%, rgba(0,0,0, 0.15));
+    background-image: -moz-linear-gradient(top, rgba(0,0,0, 0.05) 0%, rgba(0,0,0, 0.05));
+    background-image: -ms-linear-gradient(transparent, rgba(0,0,0, 0.05) 40%, rgba(0,0,0, 0.15));
+    background-image: -o-linear-gradient(transparent, rgba(0,0,0, 0.05) 40%, rgba(0,0,0, 0.05));
+    background-image: linear-gradient(transparent, rgba(0,0,0, 0.05) 40%, rgba(0,0,0, 0.05));
+}
+
+.pure-button-active,
+.pure-button:active {
+    box-shadow: 0 0 0 1px rgba(0,0,0, 0.15) inset, 0 0 6px rgba(0,0,0, 0.20) inset;
+}
+
+.pure-button[disabled],
+.pure-button-disabled,
+.pure-button-disabled:hover,
+.pure-button-disabled:active {
+    border: none;
+    background-image: none;
+    filter: progid:DXImageTransform.Microsoft.gradient(enabled = false);
+    filter: alpha(opacity=40);
+    -khtml-opacity: 0.40;
+    -moz-opacity: 0.40;
+    opacity: 0.40;
+    cursor: not-allowed;
+    box-shadow: none;
+}
+
+.pure-button-hidden {
+    display: none;
+}
+
+/* Firefox: Get rid of the inner focus border */
+.pure-button::-moz-focus-inner{
+    padding: 0;
+    border: 0;
+}
+
+.pure-button-primary,
+.pure-button-selected,
+a.pure-button-primary,
+a.pure-button-selected {
+    background-color: #20AC37;
+    color: #FFF;
+    border-radius: 4px;
+}
+
+.pure-button:-moz-focusring {
+    outline-color: rgba(0, 0, 0, 0.85);
+}
+
+
+/*! Copyright 2013 Yahoo! Inc. http://yuilibrary.com/license/ */
+/* This page lists core form styles adopted from Normalize.css. */
+/*! Copyright (c) Nicolas Gallagher and Jonathan Neal */
+
+/*! normalize.css v1.1.0 | MIT License | git.io/normalize */
+
+/* This page has Normalize.css form-specific style rules applied to a .yui3-form context */
+
+/* ==========
+Forms Core
+=========*/
+
+
+/*
+ * Corrects margin displayed oddly in IE 6/7.
+ */
+
+.pure-skin-mine .pure-form {
+    margin: 0;
+}
+
+/* Define consistent border, margin, and padding.*/
+ 
+
+.pure-skin-mine .pure-form fieldset {
+    border: 1px solid #c0c0c0;
+    margin: 0 2px;
+    padding: 0.35em 0.625em 0.75em;
+}
+
+/*
+ * 1. Corrects color not being inherited in IE 6/7/8/9.
+ * 2. Corrects text not wrapping in Firefox 3.
+ * 3. Corrects alignment displayed oddly in IE 6/7.
+ */
+
+.pure-skin-mine .pure-form legend {
+    border: 0; /* 1 */
+    padding: 0;
+    white-space: normal; /* 2 */
+    *margin-left: -7px; /* 3 */
+}
+
+/*
+ * 1. Corrects font size not being inherited in all browsers.
+ * 2. Addresses margins set differently in IE 6/7, Firefox 3+, Safari 5,
+ *    and Chrome.
+ * 3. Improves appearance and consistency in all browsers.
+ */
+
+.pure-skin-mine .pure-form button,
+.pure-skin-mine .pure-form input,
+.pure-skin-mine .pure-form select,
+.pure-skin-mine .pure-form textarea {
+    font-size: 100%; /* 1 */
+    margin: 0; /* 2 */
+    vertical-align: baseline; /* 3 */
+    *vertical-align: middle; /* 3 */
+}
+
+/*
+ * Addresses Firefox 3+ setting `line-height` on `input` using `!important` in
+ * the UA stylesheet.
+ */
+
+.pure-skin-mine .pure-form button,
+.pure-skin-mine .pure-form input {
+    line-height: normal;
+}
+
+/*
+ * 1. Avoid the WebKit bug in Android 4.0.* where (2) destroys native `audio`
+ *    and `video` controls.
+ * 2. Corrects inability to style clickable `input` types in iOS.
+ * 3. Improves usability and consistency of cursor style between image-type
+ *    `input` and others.
+ * 4. Removes inner spacing in IE 7 without affecting normal text inputs.
+ *    Known issue: inner spacing remains in IE 6.
+ */
+
+.pure-skin-mine .pure-form button,
+.pure-skin-mine .pure-form input[type="button"], /* 1 */
+.pure-skin-mine .pure-form input[type="reset"],
+.pure-skin-mine .pure-form input[type="submit"] {
+    -webkit-appearance: button; /* 2 */
+    cursor: pointer; /* 3 */
+    *overflow: visible;  /* 4 */
+}
+
+/*
+ * Re-set default cursor for disabled elements.
+ */
+
+.pure-skin-mine .pure-form button[disabled],
+.pure-skin-mine .pure-form input[disabled] {
+    cursor: default;
+}
+
+/*
+ * 1. Addresses box sizing set to content-box in IE 8/9.
+ * 2. Removes excess padding in IE 8/9.
+ * 3. Removes excess padding in IE 7.
+ *    Known issue: excess padding remains in IE 6.
+ */
+
+.pure-skin-mine .pure-form input[type="checkbox"],
+.pure-skin-mine .pure-form input[type="radio"] {
+    box-sizing: border-box; /* 1 */
+    padding: 0; /* 2 */
+    *height: 13px; /* 3 */
+    *width: 13px; /* 3 */
+}
+
+/*
+ * 1. Addresses `appearance` set to `searchfield` in Safari 5 and Chrome.
+ * 2. Addresses `box-sizing` set to `border-box` in Safari 5 and Chrome
+ *    (include `-moz` to future-proof).
+ */
+
+.pure-skin-mine .pure-form input[type="search"] {
+    -webkit-appearance: textfield; /* 1 */
+    -moz-box-sizing: content-box;
+    -webkit-box-sizing: content-box; /* 2 */
+    box-sizing: content-box;
+}
+
+/*
+ * Removes inner padding and search cancel button in Safari 5 and Chrome
+ * on OS X.
+ */
+
+.pure-skin-mine .pure-form input[type="search"]::-webkit-search-cancel-button,
+.pure-skin-mine .pure-form input[type="search"]::-webkit-search-decoration {
+    -webkit-appearance: none;
+}
+
+/*
+ * Removes inner padding and border in Firefox 3+.
+ */
+
+.pure-skin-mine .pure-form button::-moz-focus-inner,
+.pure-skin-mine .pure-form input::-moz-focus-inner {
+    border: 0;
+    padding: 0;
+}
+
+/*
+ * 1. Removes default vertical scrollbar in IE 6/7/8/9.
+ * 2. Improves readability and alignment in all browsers.
+ */
+
+.pure-skin-mine .pure-form textarea {
+    overflow: auto; /* 1 */
+    vertical-align: top; /* 2 */
+}
+/* ===============  forms-responsive.css ================
+
+=========================================================*/
+@media only screen and (max-width : 480px) {
+    .pure-skin-mine .pure-form button[type="submit"] {
+    margin: 0.7em 0 0;
+    }
+
+    .pure-skin-mine .pure-form input[type="text"],
+    .pure-skin-mine .pure-form input[type="password"],
+    .pure-skin-mine .pure-form input[type="email"],
+    .pure-skin-mine .pure-form input[type="url"],
+    .pure-skin-mine .pure-form input[type="date"],
+    .pure-skin-mine .pure-form input[type="month"],
+    .pure-skin-mine .pure-form input[type="time"],
+    .pure-skin-mine .pure-form input[type="datetime"],
+    .pure-skin-mine .pure-form input[type="datetime-local"],
+    .pure-skin-mine .pure-form input[type="week"],
+    .pure-skin-mine .pure-form input[type="number"],
+    .pure-skin-mine .pure-form input[type="search"],
+    .pure-skin-mine .pure-form input[type="tel"],
+    .pure-skin-mine .pure-form input[type="color"],
+    .pure-skin-mine .pure-form label {
+        margin-bottom: 0.3em;
+        display: block;
+    }
+    
+    .pure-skin-mine .pure-group input[type="text"],
+    .pure-skin-mine .pure-group input[type="password"],
+    .pure-skin-mine .pure-group input[type="email"],
+    .pure-skin-mine .pure-group input[type="url"],
+    .pure-skin-mine .pure-group input[type="date"],
+    .pure-skin-mine .pure-group input[type="month"],
+    .pure-skin-mine .pure-group input[type="time"],
+    .pure-skin-mine .pure-group input[type="datetime"],
+    .pure-skin-mine .pure-group input[type="datetime-local"],
+    .pure-skin-mine .pure-group input[type="week"],
+    .pure-skin-mine .pure-group input[type="number"],
+    .pure-skin-mine .pure-group input[type="search"],
+    .pure-skin-mine .pure-group input[type="tel"],
+    .pure-skin-mine .pure-group input[type="color"] {
+        margin-bottom: 0;
+    }
+
+    .pure-skin-mine .pure-form-aligned .pure-control-group label {
+        margin-bottom: 0.3em;
+        text-align: left;
+        display: block;
+        width: 100%;
+    }
+
+    .pure-skin-mine .pure-form-aligned .pure-controls {
+        margin: 1.5em 0 0 0;
+    }
+
+    /* NOTE: pure-help-inline is deprecated. Use .pure-form-message-inline instead. */
+    .pure-skin-mine .pure-form .pure-help-inline,
+    .pure-skin-mine .pure-form-message-inline,
+    .pure-skin-mine .pure-form-message {
+        display: block;
+        font-size: 80%;
+        /* increased bottom padding to make it group with its related input element */
+        padding: 0.2em 0 0.8em;
+    }
+}
+
+/* ===============  forms.css ================
+
+=========================================================*/
+.pure-skin-mine .pure-form input[type="text"],
+.pure-skin-mine .pure-form input[type="password"],
+.pure-skin-mine .pure-form input[type="email"],
+.pure-skin-mine .pure-form input[type="url"],
+.pure-skin-mine .pure-form input[type="date"],
+.pure-skin-mine .pure-form input[type="month"],
+.pure-skin-mine .pure-form input[type="time"],
+.pure-skin-mine .pure-form input[type="datetime"],
+.pure-skin-mine .pure-form input[type="datetime-local"],
+.pure-skin-mine .pure-form input[type="week"],
+.pure-skin-mine .pure-form input[type="number"],
+.pure-skin-mine .pure-form input[type="search"],
+.pure-skin-mine .pure-form input[type="tel"],
+.pure-skin-mine .pure-form input[type="color"],
+.pure-skin-mine .pure-form select,
+.pure-skin-mine .pure-form textarea {
+    padding: 0.5em 0.6em;
+    display: inline-block;
+    border: 1px solid #e6e6e6;
+    font-size: 0.8em;
+    box-shadow: inset 0 1px 3px #e6e6e6;
+    border-radius: 4px;
+    -webkit-transition: 0.3s linear border;
+    -moz-transition: 0.3s linear border;
+    -ms-transition: 0.3s linear border;
+    -o-transition: 0.3s linear border;
+    transition: 0.3s linear border;
+    -webkit-box-sizing: border-box;
+    -moz-box-sizing: border-box;
+    box-sizing: border-box;
+    -webkit-font-smoothing: antialiased;
+}
+
+.pure-skin-mine .pure-form input[type="text"]:focus,
+.pure-skin-mine .pure-form input[type="password"]:focus,
+.pure-skin-mine .pure-form input[type="email"]:focus,
+.pure-skin-mine .pure-form input[type="url"]:focus,
+.pure-skin-mine .pure-form input[type="date"]:focus,
+.pure-skin-mine .pure-form input[type="month"]:focus,
+.pure-skin-mine .pure-form input[type="time"]:focus,
+.pure-skin-mine .pure-form input[type="datetime"]:focus,
+.pure-skin-mine .pure-form input[type="datetime-local"]:focus,
+.pure-skin-mine .pure-form input[type="week"]:focus,
+.pure-skin-mine .pure-form input[type="number"]:focus,
+.pure-skin-mine .pure-form input[type="search"]:focus,
+.pure-skin-mine .pure-form input[type="tel"]:focus,
+.pure-skin-mine .pure-form input[type="color"]:focus,
+.pure-skin-mine .pure-form select:focus,
+.pure-skin-mine .pure-form textarea:focus {
+  outline: 0;
+  outline: thin dotted \9; /* IE6-9 */
+  border-color: #129FEA;
+}
+
+.pure-skin-mine .pure-form input[type="file"]:focus,
+.pure-skin-mine .pure-form input[type="radio"]:focus,
+.pure-skin-mine .pure-form input[type="checkbox"]:focus {
+  outline: thin dotted #333;
+  outline: 1px auto #129FEA;
+}
+.pure-skin-mine .pure-form .pure-checkbox,
+.pure-skin-mine .pure-form .pure-radio {
+  margin: 0.5em 0;
+  display: block;
+}
+.pure-skin-mine .pure-form input[type="text"][disabled],
+.pure-skin-mine .pure-form input[type="password"][disabled],
+.pure-skin-mine .pure-form input[type="email"][disabled],
+.pure-skin-mine .pure-form input[type="url"][disabled],
+.pure-skin-mine .pure-form input[type="date"][disabled],
+.pure-skin-mine .pure-form input[type="month"][disabled],
+.pure-skin-mine .pure-form input[type="time"][disabled],
+.pure-skin-mine .pure-form input[type="datetime"][disabled],
+.pure-skin-mine .pure-form input[type="datetime-local"][disabled],
+.pure-skin-mine .pure-form input[type="week"][disabled],
+.pure-skin-mine .pure-form input[type="number"][disabled],
+.pure-skin-mine .pure-form input[type="search"][disabled],
+.pure-skin-mine .pure-form input[type="tel"][disabled],
+.pure-skin-mine .pure-form input[type="color"][disabled],
+.pure-skin-mine .pure-form select[disabled],
+.pure-skin-mine .pure-form textarea[disabled],
+.pure-skin-mine .pure-form input[readonly],
+.pure-skin-mine .pure-form select[readonly],
+.pure-skin-mine .pure-form textarea[readonly] {
+  cursor: not-allowed;
+  box-shadow: inset 0 1px 10px #ededed;
+  background-color: #fff;
+  color: #adadad;
+  border-color: #e6e6e6;
+}
+.pure-skin-mine .pure-form input:focus:invalid,
+.pure-skin-mine .pure-form textarea:focus:invalid,
+.pure-skin-mine .pure-form select:focus:invalid {
+  color: #b94a48;
+  border: 1px solid #ee5f5b;
+}
+.pure-skin-mine .pure-form input:focus:invalid:focus,
+.pure-skin-mine .pure-form textarea:focus:invalid:focus,
+.pure-skin-mine .pure-form select:focus:invalid:focus {
+  border-color: #e9322d;
+}
+.pure-skin-mine .pure-form input[type="file"]:focus:invalid:focus,
+.pure-skin-mine .pure-form input[type="radio"]:focus:invalid:focus,
+.pure-skin-mine .pure-form input[type="checkbox"]:focus:invalid:focus {
+  outline-color: #e9322d;
+}
+.pure-skin-mine .pure-form select {
+  border: 1px solid #e6e6e6;
+  background-color: white;
+}
+.pure-skin-mine .pure-form select[multiple] {
+  height: auto;
+}
+.pure-skin-mine .pure-form label {
+  margin: 0.5em 0 0.2em;
+  color: #4f4f4f;
+  font-size:90%;
+}
+.pure-skin-mine .pure-form fieldset {
+  margin: 0;
+  padding: 0.35em 0 0.75em;
+  border: 0;
+}
+.pure-skin-mine .pure-form legend {
+  display: block;
+  width: 100%;
+  padding: 0.3em 0;
+  margin-bottom: 0.3em;
+  font-size: 125%;
+  color: #262626;
+  border-bottom: 1px solid #ededed;
+}
+
+.pure-skin-mine .pure-form-stacked label {
+  display: block;
+}
+
+.pure-skin-mine .pure-form-aligned input,
+.pure-skin-mine .pure-form-aligned textarea,
+.pure-skin-mine .pure-form-aligned select,
+.pure-skin-mine .pure-form-aligned .pure-help-inline, /* note: pure-help-inline is deprecated. Use .pure-form-message-inline instead */ 
+.pure-form-message-inline {
+  display: inline-block;
+  *display: inline; /* IE7 inline-block hack */
+  *zoom: 1;
+  vertical-align: middle;
+}
+
+/* aligned Forms */
+.pure-skin-mine .pure-form-aligned .pure-control-group {
+  margin-bottom: 0.5em;
+}
+.pure-skin-mine .pure-form-aligned .pure-control-group label {
+  text-align: right;
+  display: inline-block;
+  vertical-align: middle;
+  width: 10em;
+  margin: 0 1em 0 0;
+}
+.pure-skin-mine .pure-form-aligned .pure-controls {
+  margin: 1.5em 0 0 10em;
+}
+
+/* Rounded Inputs */
+.pure-skin-mine .pure-form .pure-input-rounded {
+  border-radius: 30px;
+  padding-left: 1em;
+}
+
+/* Grouped Inputs */
+.pure-skin-mine .pure-form .pure-group fieldset {
+  margin-bottom: 10px;
+}
+.pure-skin-mine .pure-form .pure-group input {
+  display: block;
+  padding: 0.5em 0.6em;
+  margin: 0;
+  border-radius: 0;
+  position: relative;
+  top: -1px;
+}
+.pure-skin-mine .pure-form .pure-group input:focus {
+  z-index: 2;
+}
+.pure-skin-mine .pure-form .pure-group input:first-child {
+  top: 1px;
+  border-radius: 4px 4px 0px 0px;
+}
+.pure-skin-mine .pure-form .pure-group input:last-child {
+  top: -2px;
+  border-radius: 0px 0px 4px 4px;
+}
+.pure-skin-mine .pure-form .pure-group button {
+  margin: 0.35em 0;
+}
+
+.pure-skin-mine .pure-form .pure-input-1 {
+  width: 100%;
+}
+.pure-skin-mine .pure-form .pure-input-2-3 {
+  width: 66%;
+}
+.pure-skin-mine .pure-form .pure-input-1-2 {
+  width: 50%;
+}
+.pure-skin-mine .pure-form .pure-input-1-3 {
+  width: 33%;
+}
+.pure-skin-mine .pure-form .pure-input-1-4 {
+  width: 25%;
+}
+
+/* Inline help for forms */
+/* Note: pure-help-inline is deprecated. Use .pure-form-message-inline instead */ 
+.pure-skin-mine .pure-form .pure-help-inline,
+.pure-skin-mine .pure-form-message-inline {
+  display: inline-block;
+  padding-left: 0.3em;
+  color: #adadad;
+  font-size: 90%;
+  vertical-align: middle;
+}
+
+/* Block help for forms */
+.pure-skin-mine .pure-form-message {
+  display: block;
+  margin: .5em 0 .2em;
+  color: #adadad;
+  font-size: 90%;
+}
+
+/* foundational CSS */
+.pure-skin-mine .pure-table {
+    /* Remove spacing between table cells (from Normalize.css) */
+    border-collapse: separate;
+    border-spacing: 0;
+    empty-cells: show;
+    border: 1px solid #ceeed1;
+}
+
+.pure-skin-mine .pure-table caption {
+    color: #adadad;
+    font: italic 85%/1 arial, sans-serif;
+    padding: 1em 0;
+    text-align: center;
+}
+
+.pure-skin-mine .pure-table td,
+.pure-skin-mine .pure-table th {
+    border-left: 1px solid #ceeed1;/* inner column border */
+    border-width: 0 0 0 1px;
+    font-size: inherit;
+    margin: 0;
+    overflow: visible; /*to make ths where the title is really long work*/
+    padding: 0.3em 0.6em; /* cell padding */
+}
+
+.pure-skin-mine .pure-table td:first-child,
+.pure-skin-mine .pure-table th:first-child {
+    border-left-width: 0;
+}
+
+.pure-skin-mine .pure-table thead {
+    background-color: #c3eac9;
+    color: #143919;
+    text-align: left;
+    vertical-align: bottom;
+    white-space: nowrap;
+}
+
+/*
+striping:
+even - #fff (white)
+odd - #edf5ff (light blue)
+*/
+.pure-skin-mine .pure-table td {
+    background-color: #e5f6e7;
+    color: #1b5021;
+}
+.pure-skin-mine .pure-table-odd td {
+    background-color: #ceeed1;
+    color: #102d13;
+}
+
+/* BORDERED TABLES */
+.pure-skin-mine .pure-table-bordered td {
+    border-bottom:1px solid #ceeed1;
+}
+.pure-skin-mine .pure-table-bordered tbody > tr:last-child td,
+.pure-skin-mine .pure-table-horizontal tbody > tr:last-child td {
+    border-bottom-width: 0;
+}
+
+/* HORIZONTAL BORDERED TABLES */
+.pure-skin-mine .pure-table-horizontal td,
+.pure-skin-mine .pure-table-horizontal th {
+    border-width: 0 0 1px 0;
+    border-bottom:1px solid #ceeed1;
+}
+.pure-skin-mine .pure-table-horizontal tbody > tr:last-child td {
+    border-bottom-width: 0;
+}
+
+/* from YUICSS list-core.css */
+/*csslint adjoining-classes:false, outline-none:false*/
+/*TODO: Remove this lint rule override after a refactor of this code.*/ 
+
+.pure-skin-mine .pure-menu ul {
+    position: absolute;
+    visibility: hidden;
+}
+
+.pure-skin-mine .pure-menu.pure-menu-open {
+    visibility: visible;
+    z-index: 2;
+    width: 100%;
+}
+
+.pure-skin-mine .pure-menu ul {
+    left: -10000px;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    top: -10000px;
+    z-index: 1;
+}
+
+.pure-skin-mine .pure-menu > ul { position: relative; }
+
+.pure-skin-mine .pure-menu-open > ul {
+    left: 0;
+    top: 0;
+    visibility: visible;
+}
+
+.pure-skin-mine .pure-menu-open > ul:focus {
+    outline: none;
+}
+
+.pure-skin-mine .pure-menu li {
+    position: relative;
+}
+
+.pure-skin-mine .pure-menu a, .pure-skin-mine .pure-menu .pure-menu-heading {
+    display: block;
+    color: inherit;
+    line-height: 1.5em;
+    padding: 0.35em 1.4em;
+    text-decoration: none;
+    white-space: nowrap;
+}
+
+.pure-skin-mine .pure-menu.pure-menu-horizontal > .pure-menu-heading {
+    display: inline-block;
+    *display: inline;
+    zoom: 1;
+    margin: 0;
+    vertical-align: middle;
+}
+.pure-skin-mine .pure-menu.pure-menu-horizontal > ul {
+    display: inline-block;
+    *display: inline;
+    zoom: 1;
+    vertical-align: middle;
+    height: 2.4em;
+}
+
+.pure-skin-mine .pure-menu li a { padding: 0.35em 1.4em; }
+
+.pure-skin-mine .pure-menu-can-have-children > .pure-menu-label:after {
+    content: '\25B8';
+    float: right;
+    font-family: 'Lucida Grande', 'Lucida Sans Unicode', 'DejaVu Sans', sans-serif; /* These specific fonts have the Unicode char we need. */
+    margin-right: -20px;
+    margin-top: -1px;
+}
+
+.pure-skin-mine .pure-menu-can-have-children > .pure-menu-label {
+    padding-right: 30px;
+}
+
+.pure-skin-mine .pure-menu-separator {
+    background-color: #ceeed1;
+    display: block;
+    height: 1px;
+    font-size: 0;
+    margin: 7px 2px;
+    overflow: hidden;
+}
+
+.pure-skin-mine .pure-menu-hidden {
+    display: none;
+}
+
+/* FIXED MENU */
+.pure-skin-mine .pure-menu-fixed {
+    position: fixed;
+    top:0;
+    left:0;
+    width: 100%;
+}
+
+
+/* HORIZONTAL MENU CODE */
+
+/* Initial menus should be inline-block so that they are horizontal */
+.pure-skin-mine .pure-menu-horizontal li {
+    display: inline-block;
+    *display: inline;
+    zoom: 1;
+    vertical-align: middle;
+}
+
+/* Submenus should still be display:block; */
+.pure-skin-mine .pure-menu-horizontal li li {
+    display: block;
+}
+
+/* Content after should be down arrow */
+.pure-skin-mine .pure-menu-horizontal > .pure-menu-children > .pure-menu-can-have-children > .pure-menu-label:after {
+    content: "\25BE";
+}
+/*Add extra padding to elements that have the arrow so that the hover looks nice */
+.pure-skin-mine .pure-menu-horizontal > .pure-menu-children > .pure-menu-can-have-children > .pure-menu-label {
+    padding-right:30px;
+}
+
+/* Adjusting separator for vertical menus */
+.pure-skin-mine .pure-menu-horizontal li.pure-menu-separator {
+    height: 50%;
+    width: 1px;
+    margin: 0 7px;
+}
+
+/* Submenus should be horizontal separator again */
+.pure-skin-mine .pure-menu-horizontal li li.pure-menu-separator {
+height: 1px;
+width: auto;
+margin: 7px 2px;
+}
+
+
+/* end from yuicss/list-core.css *******************************************/
+/* from yuicss list-paginator.css */
+/*csslint box-model:false*/
+/*TODO: Remove this lint rule override after a refactor of this code.*/ 
+
+.pure-skin-mine .pure-paginator {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+}
+.pure-skin-mine .pure-paginator li {
+    display: inline-block;
+    *display: inline;
+    zoom: 1;
+    margin: 0 -0.35em 0 0;
+}
+.pure-skin-mine .pure-paginator .pure-button {
+    border-radius: 0;
+    padding: 0.8em 1.4em;
+    vertical-align: top;
+    height: 1.1em;
+}
+.pure-skin-mine .pure-paginator .pure-button:focus {
+    outline-style: none;
+}
+.pure-skin-mine .pure-paginator .prev, .pure-skin-mine .pure-paginator .next {
+    /*color: #C0C1C3; allow .pure-button to color text*/
+}
+.pure-skin-mine .pure-paginator .prev {
+    border-radius: 4px 0px 0px 4px;
+}
+.pure-skin-mine .pure-paginator .next {
+    border-radius: 0px 4px 4px 0px;
+}
+/* end from YUICSS list-paginator.css ******************************/
+/* from YUICSS list.css *******************************************/
+/* MAIN MENU STYLING */
+/*csslint adjoining-classes:false*/
+/*TODO: Remove this lint rule override after a refactor of this code.*/ 
+
+.pure-skin-mine .pure-menu.pure-menu-open,
+.pure-skin-mine .pure-menu.pure-menu-horizontal li .pure-menu-children {
+    background: #e5f6e7; /* Old browsers */
+    border: 1px solid #ceeed1;
+}
+
+/* remove borders for horizontal menus */
+.pure-skin-mine .pure-menu.pure-menu-horizontal,
+.pure-skin-mine .pure-menu.pure-menu-horizontal .pure-menu-heading {
+    border: none;
+}
+
+
+
+/* LINK STYLES */
+
+.pure-skin-mine .pure-menu a {
+    border: 1px solid transparent;
+    border-left: none;
+    border-right: none;
+
+}
+
+.pure-skin-mine .pure-menu a,
+.pure-skin-mine .pure-menu .pure-menu-can-have-children > li:after {
+    color: #1b5021;
+}
+
+.pure-skin-mine .pure-menu .pure-menu-can-have-children > li:hover:after {
+    color: #102d13;
+}
+
+/* Focus style for a dropdown menu-item when the parent has been opened */
+.pure-skin-mine .pure-menu .pure-menu-open {
+    background: #b7e6bc;
+}
+
+/* HOVER STATES */
+.pure-skin-mine .pure-menu li a:hover {
+    background: #b7e6bc;
+}
+
+/* DISABLED STATES */
+.pure-skin-mine .pure-menu li.pure-menu-disabled a:hover {
+    background: #e5f6e7;
+    color: #4cc25a;
+}
+
+.pure-skin-mine .pure-menu .pure-menu-disabled > a {
+    background-image: none;
+    border-color: transparent;
+    cursor: default;
+}
+
+.pure-skin-mine .pure-menu .pure-menu-disabled > a,
+.pure-skin-mine .pure-menu .pure-menu-can-have-children.pure-menu-disabled > a:after {
+    color: #4cc25a;
+}
+
+/* HEADINGS */
+.pure-skin-mine .pure-menu .pure-menu-heading {
+    color: #0c220e;
+    text-transform: uppercase;
+    font-size: 90%;
+    margin-top: 0.5em;
+    border-bottom: solid 1px #ceeed1;
+}
+
+
+/* SELECTED MENU ITEM */
+.pure-skin-mine .pure-menu li.pure-menu-selected a {
+    background-color: #20AC37;
+    color: #010401;
+}
+
+/* FIXED MENU */
+.pure-skin-mine .pure-menu.pure-menu-open.pure-menu-fixed {
+    border: none;
+    border-bottom: 1px solid #ceeed1;
+}
+/* end from YUICSS list.css ***********************************/
+/* from YUICSS list-responsive.css ****************************/
+/* RESPONSIVE */
+
+@media (max-width: 480px) {
+
+    .pure-skin-mine .pure-menu-horizontal {
+        width:100%;
+    }
+
+    .pure-skin-mine .pure-menu-children li {
+        display: block;
+        border-bottom:1px solid #ceeed1;
+    }
+
+}
+/* end from list-responsive.css ******************/
+
+
+vendor/assets/stylesheets/bootstrap_and_overrides.css.scss
+---
+@import "bootstrap";
+body { padding-top: 60px; }
+@import "bootstrap-responsive";
+
+config/database.example.yml
+---
+---
+common: &common
+  adapter: postgresql
+  username: mauro-oto
+  password:
+  host: localhost
+  timeout: 5000
+
+development:
+  <<: *common
+  database: movie_recommendations_dev
+
+test:
+  <<: *common
+  database: movie_recommendations_test
+
+production:
+  <<: *common
+  database: movie_recommendations_prod
+
+config/database.yml
+---
+---
+common: &common
+  adapter: postgresql
+  username: mauro-oto
+  password:
+  host: localhost
+  timeout: 5000
+
+development:
+  <<: *common
+  database: movies_cucumbers_dev
+
+test:
+  <<: *common
+  database: movies_cucumbers_test
+
+production:
+  <<: *common
+  database: movie_recommendations_prod
+
+config/locales/devise.en.yml
+---
+# Additional translations at https://github.com/plataformatec/devise/wiki/I18n
+
+en:
+  devise:
+    confirmations:
+      confirmed: "Your account was successfully confirmed. You are now signed in."
+      send_instructions: "You will receive an email with instructions about how to confirm your account in a few minutes."
+      send_paranoid_instructions: "If your email address exists in our database, you will receive an email with instructions about how to confirm your account in a few minutes."
+    failure:
+      already_authenticated: "You are already signed in."
+      inactive: "Your account was not activated yet."
+      invalid: "Invalid email or password."
+      invalid_token: "Invalid authentication token."
+      locked: "Your account is locked."
+      not_found_in_database: "Invalid email or password."
+      timeout: "Your session expired, please sign in again to continue."
+      unauthenticated: "You need to sign in or sign up before continuing."
+      unconfirmed: "You have to confirm your account before continuing."
+    mailer:
+      confirmation_instructions:
+        subject: "Confirmation instructions"
+      reset_password_instructions:
+        subject: "Reset password instructions"
+      unlock_instructions:
+        subject: "Unlock Instructions"
+    omniauth_callbacks:
+      failure: "Could not authenticate you from %{kind} because \"%{reason}\"."
+      success: "Successfully authenticated from %{kind} account."
+    passwords:
+      no_token: "You can't access this page without coming from a password reset email. If you do come from a password reset email, please make sure you used the full URL provided."
+      send_instructions: "You will receive an email with instructions about how to reset your password in a few minutes."
+      send_paranoid_instructions: "If your email address exists in our database, you will receive a password recovery link at your email address in a few minutes."
+      updated: "Your password was changed successfully. You are now signed in."
+      updated_not_active: "Your password was changed successfully."
+    registrations:
+      destroyed: "Bye! Your account was successfully cancelled. We hope to see you again soon."
+      signed_up: "Welcome! You have signed up successfully."
+      signed_up_but_inactive: "You have signed up successfully. However, we could not sign you in because your account is not yet activated."
+      signed_up_but_locked: "You have signed up successfully. However, we could not sign you in because your account is locked."
+      signed_up_but_unconfirmed: "A message with a confirmation link has been sent to your email address. Please open the link to activate your account."
+      update_needs_confirmation: "You updated your account successfully, but we need to verify your new email address. Please check your email and click on the confirm link to finalize confirming your new email address."
+      updated: "You updated your account successfully."
+    sessions:
+      signed_in: "Signed in successfully."
+      signed_out: "Signed out successfully."
+    unlocks:
+      send_instructions: "You will receive an email with instructions about how to unlock your account in a few minutes."
+      send_paranoid_instructions: "If your account exists, you will receive an email with instructions about how to unlock it in a few minutes."
+      unlocked: "Your account has been unlocked successfully. Please sign in to continue."
+  errors:
+    messages:
+      already_confirmed: "was already confirmed, please try signing in"
+      confirmation_period_expired: "needs to be confirmed within %{period}, please request a new one"
+      expired: "has expired, please request a new one"
+      not_found: "not found"
+      not_locked: "was not locked"
+      not_saved:
+        one: "1 error prohibited this %{resource} from being saved:"
+        other: "%{count} errors prohibited this %{resource} from being saved:"
+
+config/locales/en.yml
+---
+# Sample localization file for English. Add more files in this directory for other locales.
+# See https://github.com/svenfuchs/rails-i18n/tree/master/rails%2Flocale for starting points.
+
+en:
+  hello: "Hello world"
+
+config/locales/simple_form.en.yml
+---
+en:
+  simple_form:
+    "yes": 'Yes'
+    "no": 'No'
+    required:
+      text: 'required'
+      mark: '*'
+      # You can uncomment the line below if you need to overwrite the whole required html.
+      # When using html, text and mark won't be used.
+      # html: '<abbr title="required">*</abbr>'
+    error_notification:
+      default_message: "Please review the problems below:"
+    # Labels and hints examples
+    # labels:
+    #   defaults:
+    #     password: 'Password'
+    #   user:
+    #     new:
+    #       email: 'E-mail to sign in.'
+    #     edit:
+    #       email: 'E-mail.'
+    # hints:
+    #   defaults:
+    #     username: 'User name to sign in.'
+    #     password: 'No special characters, please.'
+
+
+lib/tasks/movies.rake
+---
+desc "Populate movies from The Movie DB"
+task :populate_from_tmdb, [:min_id, :max_id] => :environment do |_, args|
+  (args[:min_id]).upto(args[:max_id]) do |i|
+    movie = TmdbMovie.find(id: i)
+    next if movie.empty? || movie.runtime.nil? || movie.runtime < 45
+
+    movie_in_db = Movie.find_or_create_by(tmdb_id: movie.id)
+    movie_in_db.update_attributes(
+      title:        movie.name,
+      release_date: Date.parse(movie.released),
+      tmdb_rating:  movie.rating,
+      poster_url:   movie.posters.try(:[], 2).try(:url),
+      trailer_url:  movie.trailer || "http://www.apple.com/trailers",
+      mpaa_rating:  movie.certification,
+      run_time:     movie.runtime,
+      imdb_ref:     movie.imdb_id,
+      budget:       movie.budget
+    )
+
+    actors_in_film = []
+    directors_in_film = []
+    movie.cast.each do |cast_member|
+      if cast_member.job == "Director"
+        directors_in_film << cast_member.name
+      elsif cast_member.job == "Actor"
+        actors_in_film << cast_member.name
+      end
+    end
+
+    directors_in_film.each do |director|
+      movie_in_db.directors << Director.find_or_create_by(name: director)
+    end
+
+    3.times do |i|
+      movie_in_db.actors << Actor.find_or_create_by(name: actors_in_film[i])
+    end
+
+    movie.genres.each do |genre|
+      movie_in_db.genres << Genre.find_or_create_by(name: genre.name)
+    end
+
+    puts "Added movie #{movie.name}"
+    sleep 1
+  end
+end
+
+lib/tasks/users.rake
+---
+desc "Creates two default users with default ratings"
+task seed_users: :environment do
+  user = User.find_or_create_by(email: "mauro.otonelli@gmail.com",
+                                password: "password",
+                                password_confirmation: "password")
+
+  user_2 = User.find_or_create_by(email: "pepe@example.com",
+                                  password: "password",
+                                  password_confirmation: "password")
+
+  fight_club =    Movie.where(title: "Fight Club").first.id
+  pulp_fiction =  Movie.where(title: "Pulp Fiction").first.id
+  the_godfather = Movie.where(title: "The Godfather").first.id
+  forrest_gump =  Movie.where(title: "Forrest Gump").first.id
+  inception =     Movie.where(title: "Inception").first.id
+  titanic =       Movie.where(title: "Titanic").first.id
+  scary_movie =   Movie.where(title: "Scary Movie").first.id
+
+  rating_1 = Rating.create(movie_id: fight_club, rating_value: 5)
+  user.ratings << rating_1
+  RecommendationSystem.new(rating_1).update_recommendations
+
+  rating_2 = Rating.create(movie_id: pulp_fiction, rating_value: 5)
+  user.ratings << rating_2
+  RecommendationSystem.new(rating_2).update_recommendations
+
+  rating_3 = Rating.create(movie_id: the_godfather, rating_value: 5)
+  user.ratings << rating_3
+  RecommendationSystem.new(rating_3).update_recommendations
+
+  rating_4 = Rating.create(movie_id: forrest_gump, rating_value: 3)
+  user.ratings << rating_4
+  RecommendationSystem.new(rating_4).update_recommendations
+
+  rating_5 = Rating.create(movie_id: inception, rating_value: 4)
+  user.ratings << rating_5
+  RecommendationSystem.new(rating_5).update_recommendations
+
+  rating_6 = Rating.create(movie_id: titanic, rating_value: 3)
+  user.ratings << rating_6
+  RecommendationSystem.new(rating_6).update_recommendations
+
+  rating_7 = Rating.create(movie_id: fight_club, rating_value: 4)
+  user_2.ratings << rating_7
+  RecommendationSystem.new(rating_7).update_recommendations
+
+  rating_8 = Rating.create(movie_id: pulp_fiction, rating_value: 5)
+  user_2.ratings << rating_8
+  RecommendationSystem.new(rating_8).update_recommendations
+
+  rating_9 = Rating.create(movie_id: the_godfather, rating_value: 5)
+  user_2.ratings << rating_9
+  RecommendationSystem.new(rating_9).update_recommendations
+
+  rating_10 = Rating.create(movie_id: forrest_gump, rating_value: 5)
+  user_2.ratings << rating_10
+  RecommendationSystem.new(rating_10).update_recommendations
+
+  rating_11 = Rating.create(movie_id: inception, rating_value: 5)
+  user_2.ratings << rating_11
+  RecommendationSystem.new(rating_11).update_recommendations
+
+  rating_12 = Rating.create(movie_id: scary_movie, rating_value: 3)
+  user_2.ratings << rating_12
+  RecommendationSystem.new(rating_12).update_recommendations
+end
+
+public/404.html
+---
+<!DOCTYPE html>
+<html>
+<head>
+  <title>The page you were looking for doesn't exist (404)</title>
+  <style type="text/css">
+    body { background-color: #fff; color: #666; text-align: center; font-family: arial, sans-serif; }
+    div.dialog {
+      width: 25em;
+      padding: 0 4em;
+      margin: 4em auto 0 auto;
+      border: 1px solid #ccc;
+      border-right-color: #999;
+      border-bottom-color: #999;
+    }
+    h1 { font-size: 100%; color: #f00; line-height: 1.5em; }
+  </style>
+</head>
+
+<body>
+  <!-- This file lives in public/404.html -->
+  <div class="dialog">
+    <h1>The page you were looking for doesn't exist.</h1>
+    <p>You may have mistyped the address or the page may have moved.</p>
+  </div>
+</body>
+</html>
+
+public/422.html
+---
+<!DOCTYPE html>
+<html>
+<head>
+  <title>The change you wanted was rejected (422)</title>
+  <style type="text/css">
+    body { background-color: #fff; color: #666; text-align: center; font-family: arial, sans-serif; }
+    div.dialog {
+      width: 25em;
+      padding: 0 4em;
+      margin: 4em auto 0 auto;
+      border: 1px solid #ccc;
+      border-right-color: #999;
+      border-bottom-color: #999;
+    }
+    h1 { font-size: 100%; color: #f00; line-height: 1.5em; }
+  </style>
+</head>
+
+<body>
+  <!-- This file lives in public/422.html -->
+  <div class="dialog">
+    <h1>The change you wanted was rejected.</h1>
+    <p>Maybe you tried to change something you didn't have access to.</p>
+  </div>
+</body>
+</html>
+
+public/500.html
+---
+<!DOCTYPE html>
+<html>
+<head>
+  <title>We're sorry, but something went wrong (500)</title>
+  <style type="text/css">
+    body { background-color: #fff; color: #666; text-align: center; font-family: arial, sans-serif; }
+    div.dialog {
+      width: 25em;
+      padding: 0 4em;
+      margin: 4em auto 0 auto;
+      border: 1px solid #ccc;
+      border-right-color: #999;
+      border-bottom-color: #999;
+    }
+    h1 { font-size: 100%; color: #f00; line-height: 1.5em; }
+  </style>
+</head>
+
+<body>
+  <!-- This file lives in public/500.html -->
+  <div class="dialog">
+    <h1>We're sorry, but something went wrong.</h1>
+  </div>
+</body>
+</html>
+
+tmp/capybara/capybara-201606212145376975588641.html
+---
+<!DOCTYPE html><html><head>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Movie Recommendation System</title>
+  <link href="https://fonts.googleapis.com/css?family=Oxygen:400,300,700" rel="stylesheet" type="text/css">
+  <link href="/assets/application.css" media="all" rel="stylesheet" type="text/css">
+  <script src="/assets/application.js" type="text/javascript"></script>
+  
+  
+</head>
+
+  <body class="recommendations index" style="">
+    <div class="row-fluid">
+      <div class="navbar navbar-fixed-top">
+        <nav class="navbar-inner">
+          <div class="container">
+           <h1><a href="/">Movie Recommendations</a></h1>
+<ul class="nav">
+   <li>
+     <a href="/recommendations" id="recommendation" class="selected">
+      <i class="icon-film"></i> Recommendations
+</a>   </li>
+   <li>
+    <a href="/ratings" id="rate">
+      <i class="icon-thumbs-up-alt"></i> Rate Movies
+</a>  </li>
+  <li>
+    <a href="/users/ratings">
+      <i class="icon-archive"></i> My Ratings
+</a>  </li>
+  <li>
+    <a href="/users/edit">
+      <i class="icon-user"></i> My Account
+</a>  </li>
+  <li>
+    <a href="/users/sign_out" data-method="delete" rel="nofollow">Logout</a>
+  </li>
+</ul>
+
+          </div>
+        </nav>
+      </div>
+
+      	<div id="search">
+	  <form accept-charset="UTF-8" action="/search" class="pure-form pure-g" method="get"><div style="margin:0;padding:0;display:inline"><input name="utf8" type="hidden" value="✓"></div>
+	    <input class="pure-input-1-2" id="query" name="query" placeholder="Search for keywords" type="text">
+	    <button class="pure-button pure-button-primary"><i class="icon-search"></i> Search</button>
+</form>	</div>
+
+
+      <div id="main" role="main">
+        <div class="container">
+          <div class="span12">
+            
+            <div class="movie-list">
+    <h2><a href="/ratings">Please rate more movies to receive recommendations!</a></h2>
+
+</div>
+
+          </div>
+         </div> <!--! end of container -->
+      </div> <!--! end of #main -->
+
+      <div class="lower">
+
+	<div class="lower-box">
+		<div class="column-1">
+			<div class="column-1-title">
+				About
+			</div>
+			<div class="github"><br>
+				<a href="http://www.github.com/mauro_oto">Mauro Otonelli</a><br>
+			</div>
+		</div>
+
+	<div class="column-2">
+		<img alt="Paramount-logo" id="stars" src="/assets/paramount-logo.png">
+		<div id="logo">
+			<img alt="Mascot" height="200" src="/assets/mascot.png" width="120">
+		</div>
+	</div>
+
+	<div class="column-3">
+		<div class="copyright">
+			<br>
+			<br>
+			<br>
+			<br>
+			A <a href="http://www.devbootcamp.com">DevBootCamp</a> Original
+		</div>
+		<div class="devbootcamp">
+			<img alt="Devbootcamp" src="/assets/devbootcamp.png">
+		</div>
+	</div>
+
+</div>
+
+</div>
+
+    </div>
+  
+
+</body></html>
+tmp/capybara/capybara-201606212148014381424120.html
+---
+<!DOCTYPE html><html><head>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Movie Recommendation System</title>
+  <link href="https://fonts.googleapis.com/css?family=Oxygen:400,300,700" rel="stylesheet" type="text/css">
+  <link href="/assets/application.css" media="all" rel="stylesheet" type="text/css">
+  <script src="/assets/application.js" type="text/javascript"></script>
+  
+  
+</head>
+
+  <body class="recommendations index" style="">
+    <div class="row-fluid">
+      <div class="navbar navbar-fixed-top">
+        <nav class="navbar-inner">
+          <div class="container">
+           <h1><a href="/">Movie Recommendations</a></h1>
+<ul class="nav">
+   <li>
+     <a href="/recommendations" id="recommendation" class="selected">
+      <i class="icon-film"></i> Recommendations
+</a>   </li>
+   <li>
+    <a href="/ratings" id="rate">
+      <i class="icon-thumbs-up-alt"></i> Rate Movies
+</a>  </li>
+  <li>
+    <a href="/users/ratings">
+      <i class="icon-archive"></i> My Ratings
+</a>  </li>
+  <li>
+    <a href="/users/edit">
+      <i class="icon-user"></i> My Account
+</a>  </li>
+  <li>
+    <a href="/users/sign_out" data-method="delete" rel="nofollow">Logout</a>
+  </li>
+</ul>
+
+          </div>
+        </nav>
+      </div>
+
+      	<div id="search">
+	  <form accept-charset="UTF-8" action="/search" class="pure-form pure-g" method="get"><div style="margin:0;padding:0;display:inline"><input name="utf8" type="hidden" value="✓"></div>
+	    <input class="pure-input-1-2" id="query" name="query" placeholder="Search for keywords" type="text">
+	    <button class="pure-button pure-button-primary"><i class="icon-search"></i> Search</button>
+</form>	</div>
+
+
+      <div id="main" role="main">
+        <div class="container">
+          <div class="span12">
+            
+            <div class="movie-list">
+    <h2><a href="/ratings">Please rate more movies to receive recommendations!</a></h2>
+
+</div>
+
+          </div>
+         </div> <!--! end of container -->
+      </div> <!--! end of #main -->
+
+      <div class="lower">
+
+	<div class="lower-box">
+		<div class="column-1">
+			<div class="column-1-title">
+				About
+			</div>
+			<div class="github"><br>
+				<a href="http://www.github.com/mauro_oto">Mauro Otonelli</a><br>
+			</div>
+		</div>
+
+	<div class="column-2">
+		<img alt="Paramount-logo" id="stars" src="/assets/paramount-logo.png">
+		<div id="logo">
+			<img alt="Mascot" height="200" src="/assets/mascot.png" width="120">
+		</div>
+	</div>
+
+	<div class="column-3">
+		<div class="copyright">
+			<br>
+			<br>
+			<br>
+			<br>
+			A <a href="http://www.devbootcamp.com">DevBootCamp</a> Original
+		</div>
+		<div class="devbootcamp">
+			<img alt="Devbootcamp" src="/assets/devbootcamp.png">
+		</div>
+	</div>
+
+</div>
+
+</div>
+
+    </div>
+  
+
+</body></html>
+tmp/capybara/capybara-20160621214947514438575.html
+---
+<!DOCTYPE html><html><head>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Movie Recommendation System</title>
+  <link href="https://fonts.googleapis.com/css?family=Oxygen:400,300,700" rel="stylesheet" type="text/css">
+  <link href="/assets/application.css" media="all" rel="stylesheet" type="text/css">
+  <script src="/assets/application.js" type="text/javascript"></script>
+  
+  
+</head>
+
+  <body class="recommendations index" style="">
+    <div class="row-fluid">
+      <div class="navbar navbar-fixed-top">
+        <nav class="navbar-inner">
+          <div class="container">
+           <h1><a href="/">Movie Recommendations</a></h1>
+<ul class="nav">
+   <li>
+     <a href="/recommendations" id="recommendation" class="selected">
+      <i class="icon-film"></i> Recommendations
+</a>   </li>
+   <li>
+    <a href="/ratings" id="rate">
+      <i class="icon-thumbs-up-alt"></i> Rate Movies
+</a>  </li>
+  <li>
+    <a href="/users/ratings">
+      <i class="icon-archive"></i> My Ratings
+</a>  </li>
+  <li>
+    <a href="/users/edit">
+      <i class="icon-user"></i> My Account
+</a>  </li>
+  <li>
+    <a href="/users/sign_out" data-method="delete" rel="nofollow">Logout</a>
+  </li>
+</ul>
+
+          </div>
+        </nav>
+      </div>
+
+      	<div id="search">
+	  <form accept-charset="UTF-8" action="/search" class="pure-form pure-g" method="get"><div style="margin:0;padding:0;display:inline"><input name="utf8" type="hidden" value="✓"></div>
+	    <input class="pure-input-1-2" id="query" name="query" placeholder="Search for keywords" type="text">
+	    <button class="pure-button pure-button-primary"><i class="icon-search"></i> Search</button>
+</form>	</div>
+
+
+      <div id="main" role="main">
+        <div class="container">
+          <div class="span12">
+            
+            <div class="movie-list">
+    <h2><a href="/ratings">Please rate more movies to receive recommendations!</a></h2>
+
+</div>
+
+          </div>
+         </div> <!--! end of container -->
+      </div> <!--! end of #main -->
+
+      <div class="lower">
+
+	<div class="lower-box">
+		<div class="column-1">
+			<div class="column-1-title">
+				About
+			</div>
+			<div class="github"><br>
+				<a href="http://www.github.com/mauro_oto">Mauro Otonelli</a><br>
+			</div>
+		</div>
+
+	<div class="column-2">
+		<img alt="Paramount-logo" id="stars" src="/assets/paramount-logo.png">
+		<div id="logo">
+			<img alt="Mascot" height="200" src="/assets/mascot.png" width="120">
+		</div>
+	</div>
+
+	<div class="column-3">
+		<div class="copyright">
+			<br>
+			<br>
+			<br>
+			<br>
+			A <a href="http://www.devbootcamp.com">DevBootCamp</a> Original
+		</div>
+		<div class="devbootcamp">
+			<img alt="Devbootcamp" src="/assets/devbootcamp.png">
+		</div>
+	</div>
+
+</div>
+
+</div>
+
+    </div>
+  
+
+</body></html>
+config.ru
+---
+# This file is used by Rack-based servers to start the application.
+
+require ::File.expand_path('../config/environment',  __FILE__)
+run MovieRecommendations::Application
+
+Procfile
+---
+web: bundle exec rails server -p $PORT
+worker: bundle exec sidekiq -c 4
+
+Rakefile
+---
+#!/usr/bin/env rake
+# Add your own tasks in files placed in lib/tasks ending in .rake,
+# for example lib/tasks/capistrano.rake, and they will automatically be available to Rake.
+
+require File.expand_path('../config/application', __FILE__)
+
+MovieRecommendations::Application.load_tasks
+
+Gemfile
+---
+source 'https://rubygems.org'
+ruby '2.1.2'
+
+gem 'rails', '~> 4.2.0'
+gem 'pg'
+
+gem 'sass-rails',   '~> 4.0.0'
+gem 'coffee-rails', '~> 4.0.0'
+gem 'uglifier',     '>= 1.3.0'
+
+gem 'jquery-rails'
+gem 'bootstrap-sass'
+gem 'devise', '~> 3.5.0'
+gem 'sidekiq'
+gem 'pose', '~> 3.0.0'
+
+gem 'httparty'
+gem 'ruby-tmdb'
+
+gem 'protected_attributes'
+
+group :development do
+  gem 'guard-rspec'
+  gem 'pry'
+  gem 'pry-nav'
+  gem 'pry-rails'
+  gem 'spring'
+  gem 'quiet_assets'
+  gem 'benchmark-ips'
+end
+
+group :development, :test do
+  gem 'factory_girl_rails'
+  gem 'faker'
+end
+
+group :test do
+  gem 'capybara'
+  gem 'capybara-webkit'
+  gem 'rspec-rails'
+  gem 'database_cleaner'
+  gem 'email_spec'
+  gem 'minitest'
+end
+

@@ -1,0 +1,29 @@
+<ul class="nav">
+  <% if user_signed_in? %>
+   <li>
+     <%= link_to recommendations_path, id: 'recommendation' do %>
+      <i class="icon-film"></i> Recommendations
+     <% end %>
+   </li>
+   <li>
+    <%= link_to ratings_path, id: 'rate' do %>
+      <i class="icon-thumbs-up-alt"></i> Rate Movies
+    <% end %>
+  </li>
+  <li>
+    <%= link_to user_ratings_path do %>
+      <i class="icon-archive"></i> My Ratings
+    <% end %>
+  </li>
+  <li>
+    <%= link_to 'Logout', destroy_user_session_path, method: :delete %>
+  </li>
+  <% else %>
+    <li>
+      <%= link_to 'Sign up', root_path %>
+    </li>
+    <li>
+      <%= link_to 'Login', new_user_session_path %>
+    </li>
+  <% end %>
+</ul>

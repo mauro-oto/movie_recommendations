@@ -1,0 +1,27 @@
+<!-- <div class='login-background'> -->
+	<div class="front-form">
+
+	<%= form_for(resource, as: resource_name, url: registration_path(resource_name)) do |f| %>
+		<div class="errors">
+	  	<%= devise_error_messages! %>
+		</div>
+
+	  <div class="email">
+	  	<%= f.email_field :email, placeholder: "juan@perez.com" %>
+		</div>
+
+	  <div class="password">
+	  	<%= f.password_field :password, placeholder: "Password" %>
+		</div>
+
+	  <div class="password-confirm">
+	  	<%= f.password_field :password_confirmation, placeholder: "Password Confirmation" %>
+		</div>
+
+	  <div class="actions">
+			<%= f.submit "Sign up", class: "pure-button pure-button-primary" %>
+		</div>
+	<% end %>
+
+	</div>
+<!-- </div> -->

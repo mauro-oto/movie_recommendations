@@ -1,0 +1,12 @@
+<div class='movie-list'>
+  <% @movies.each do |movie| %>
+    <% rated_movie =  @ratings.include? movie.id  %>
+    <% current_rating = @rating_values[movie.id].to_i %>
+    <% if rated_movie %>
+      <% rating = Rating.where(movie_id: movie.id, user_id: current_user.id).first %>
+      <%= render 'shared/movie', movie: movie, rated_movie: rated_movie, current_rating: current_rating, rating: rating %>
+    <% else %>
+      <%= render 'shared/movie_no_rating', movie: movie, rated_movie: rated_movie, current_rating: current_rating%>
+    <% end %>
+  <% end %>
+</div>
